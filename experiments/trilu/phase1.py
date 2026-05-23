@@ -252,17 +252,23 @@ class TinyGPT(nn.Module):
 # Data
 
 def _load_data_shard(path: Path) -> torch.Tensor:
-    """Load a modded-nanogpt .bin shard. 256 int32 header + uint16 token stream."""
-    header = torch.from_file(str(path), False, 256, dtype=torch.int32)
-    assert header[0].item() == 20240520, f"magic mismatch in {path}"
-    assert header[1].item() == 1, f"unsupported version in {path}"
-    num_tokens = int(header[2].item())
+    """Load a modded-nanogpt .bin shard. 256 int32 header + uint16 token stream.
+
+    Returns int64 (long) so embedding lookups don't need a runtime cast.
+    Clones the tensor so it owns its memory — sharing numpy-owned memory
+    with MPS has caused SIGBUS on Apple Silicon in some torch builds.
+    """
+    import numpy as np
+    header = np.fromfile(path, dtype=np.int32, count=256)
+    assert header[0] == 20240520, f"magic mismatch in {path}"
+    assert header[1] == 1, f"unsupported version in {path}"
+    num_tokens = int(header[2])
     with path.open("rb") as f:
         f.seek(256 * 4)
-        tokens = torch.empty(num_tokens, dtype=torch.uint16)
-        nbytes = f.readinto(tokens.numpy())
-        assert nbytes == 2 * num_tokens, f"short read in {path}"
-    return tokens
+        tokens_np = np.fromfile(f, dtype=np.uint16, count=num_tokens)
+    assert tokens_np.size == num_tokens, f"short read in {path}"
+    # cast to int64 in numpy (cheap), then clone into a torch-owned buffer
+    return torch.from_numpy(tokens_np.astype(np.int64)).clone()
 
 
 def load_data(data_dir: str = "data/fineweb10B", train_cap: int = 0, val_cap: int = 0):
@@ -274,9 +280,9 @@ def load_data(data_dir: str = "data/fineweb10B", train_cap: int = 0, val_cap: in
         print("Run from repo root:  python data/cached_fineweb10B.py 1")
         sys.exit(1)
     print(f"Loading train shard: {train_files[0].name}")
-    train = _load_data_shard(train_files[0]).int()  # int32 to be safe; tokens fit easily
+    train = _load_data_shard(train_files[0])  # already int32
     print(f"Loading val shard:   {val_files[0].name}")
-    val = _load_data_shard(val_files[0]).int()
+    val = _load_data_shard(val_files[0])
     if train_cap:
         train = train[:train_cap]
     if val_cap:
@@ -289,8 +295,8 @@ def load_data(data_dir: str = "data/fineweb10B", train_cap: int = 0, val_cap: in
 def sample_batch(data: torch.Tensor, batch_size: int, seq_len: int, device, generator: torch.Generator):
     """Sample random contiguous windows."""
     high = len(data) - seq_len - 1
-    ix = torch.randint(0, high, (batch_size,), generator=generator)
-    batch = torch.stack([data[i : i + seq_len + 1].long() for i in ix])
+    ix = torch.randint(0, high, (batch_size,), generator=generator).tolist()
+    batch = torch.stack([data[i : i + seq_len + 1] for i in ix]).contiguous()
     return batch.to(device, non_blocking=True)
 
 
@@ -394,7 +400,9 @@ def train_one(config, train_data, val_data, seed, device):
 # -----------------------------------------------------------------------------
 # Main
 
-def pick_device():
+def pick_device(force: str = None):
+    if force:
+        return force
     if torch.cuda.is_available():
         return "cuda"
     if torch.backends.mps.is_available():
@@ -443,6 +451,9 @@ def main():
                     choices=list(_INIT_VALUES))
     ap.add_argument("--data-dir", type=str, default="data/fineweb10B")
     ap.add_argument("--out", type=str, default="experiments/trilu/results.json")
+    ap.add_argument("--device", type=str, default=None,
+                    choices=[None, "cpu", "mps", "cuda"],
+                    help="override device auto-detection (try --device cpu if MPS crashes)")
     args = ap.parse_args()
 
     if args.tiny:
@@ -452,7 +463,7 @@ def main():
     if args.steps is not None:
         cfg_base["total_steps"] = args.steps
 
-    device = pick_device()
+    device = pick_device(args.device)
     print(f"Device: {device}")
     print(f"Config: {args.config}  steps={cfg_base['total_steps']}  seeds={args.seeds}")
 
