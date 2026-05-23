@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Modded-NanoGPT Competition Strategy</title>
+<style>
+  :root {
+    --fg: #1a1a1a;
+    --muted: #555;
+    --accent: #2c5aa0;
+    --bg: #fdfdfd;
+    --code-bg: #f4f4f6;
+    --rule-bg: #fffceb;
+    --warn-bg: #fff0ec;
+    --good-bg: #ecf8ec;
+    --border: #ddd;
+  }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    color: var(--fg);
+    background: var(--bg);
+    max-width: 880px;
+    margin: 2em auto;
+    padding: 0 1.4em;
+    line-height: 1.55;
+  }
+  h1 { border-bottom: 2px solid var(--accent); padding-bottom: 0.3em; }
+  h2 { border-bottom: 1px solid var(--border); padding-bottom: 0.2em; margin-top: 2em; color: var(--accent); }
+  h3 { margin-top: 1.5em; }
+  code, pre { font-family: "SF Mono", Menlo, monospace; font-size: 0.92em; }
+  code { background: var(--code-bg); padding: 0.1em 0.35em; border-radius: 3px; }
+  pre { background: var(--code-bg); padding: 0.9em 1.2em; border-radius: 5px; overflow-x: auto; border: 1px solid var(--border); }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+  th, td { border: 1px solid var(--border); padding: 0.5em 0.75em; text-align: left; vertical-align: top; }
+  th { background: #f0f4fa; }
+  .rule-card {
+    background: var(--rule-bg);
+    border: 1.5px solid #d4b441;
+    border-radius: 6px;
+    padding: 1em 1.4em;
+    margin: 1em 0;
+    font-family: "SF Mono", Menlo, monospace;
+    font-size: 0.92em;
+  }
+  .warn { background: var(--warn-bg); border-left: 4px solid #cc4530; padding: 0.6em 1em; margin: 1em 0; }
+  .good { background: var(--good-bg); border-left: 4px solid #4a8a4a; padding: 0.6em 1em; margin: 1em 0; }
+  .muted { color: var(--muted); font-size: 0.9em; }
+  .tier { font-weight: bold; color: var(--accent); }
+  .formula { font-family: "STIX Two Math", "Cambria Math", serif; font-style: italic; padding: 0.2em 0.4em; background: var(--code-bg); border-radius: 3px; }
+  ul, ol { padding-left: 1.6em; }
+  li { margin: 0.25em 0; }
+  .toc { background: #f6f8fb; border: 1px solid var(--border); padding: 1em 1.4em; border-radius: 5px; margin: 1.4em 0; }
+  .toc ol { margin: 0; }
+  .footer { margin-top: 3em; padding-top: 1em; border-top: 1px solid var(--border); color: var(--muted); font-size: 0.85em; }
+</style>
+</head>
+<body>
+
+<h1>Modded-NanoGPT: Competition Strategy &amp; Experiment Plan</h1>
+
+<p class="muted">Working document. Private fork of <code>KellerJordan/modded-nanogpt</code>. Author: Adam Holmes.</p>
+
+<div class="toc">
+<strong>Contents</strong>
+<ol>
+  <li><a href="#goals">Goals &amp; Motivation</a></li>
+  <li><a href="#rules">Rules of the Competition</a></li>
+  <li><a href="#hardware">Hardware &amp; Where the Time Goes</a></li>
+  <li><a href="#workflow">Workflow &amp; Infrastructure</a></li>
+  <li><a href="#landscape">Strategic Landscape: Track 1 vs Track 2</a></li>
+  <li><a href="#ideas">Ideas Ranked by Leverage</a></li>
+  <li><a href="#activation">Detailed Plan: TriLU Activation Function Experiment</a></li>
+  <li><a href="#risks">Risks &amp; Open Questions</a></li>
+</ol>
+</div>
+
+<h2 id="goals">1. Goals &amp; Motivation</h2>
+
+<p>The dual goal of competing on modded-nanogpt is (a) to learn modern LLM training engineering deeply, and (b) to produce a portfolio artifact strong enough to back a job search in AI/ML roles.</p>
+
+<p>Both goals point at the same activity but bias the choice of <em>what</em> to do:</p>
+
+<ul>
+  <li><strong>For learning</strong>, depth beats breadth. Picking one or two areas (kernels, optimizers, activations) and going deep teaches more than mechanically porting twenty features.</li>
+  <li><strong>For career signal</strong>, the visible artifact is a writeup &mdash; not a leaderboard line. A leaderboard entry is googleable proof of competence, but the blog post / X thread / PR description is what does the work in hiring conversations. Frontier-lab and ML-infra hiring managers recognize modded-nanogpt; outside that bubble (generic SWE), it&rsquo;s a curiosity that requires context.</li>
+</ul>
+
+<p>The honest signal hierarchy (approximate):</p>
+
+<ol>
+  <li>Novel idea that becomes a leaderboard record (hard; weeks-to-months; may fail)</li>
+  <li>Systematic empirical study published as a blog post, with new insight, even without a record (achievable, high payoff)</li>
+  <li>Leaderboard record from careful ports + retuning + writeup (achievable, reasonable signal)</li>
+  <li>Small but real systems-level contribution on Track 1 (signals strong ML engineering)</li>
+  <li>Running existing code without a record or writeup (low signal)</li>
+</ol>
+
+<p>Conclusion: aim for tier 2&ndash;3. Don&rsquo;t aim for &ldquo;any record at any cost.&rdquo; Aim for an experiment whose results are interesting <em>whether or not</em> they yield a record.</p>
+
+<h2 id="rules">2. Rules of the Competition</h2>
+
+<div class="rule-card">
+<strong>Modded-NanoGPT Rules &mdash; Index Card</strong>
+<ol>
+  <li><strong>Data is FROZEN.</strong> Don&rsquo;t change the token streams.<br>(Batch size, seq len, attention pattern: OK.)</li>
+  <li><strong>Hit target loss</strong> on FineWeb val (10.485M tokens):<br>
+    &nbsp;&nbsp;Track 1 (Small): &le; 3.28<br>
+    &nbsp;&nbsp;Track 2 (Medium): &le; 2.92</li>
+  <li><strong>Statistical significance</strong>: p &lt; 0.01 that mean val loss meets target. Systems-only PRs exempt.</li>
+  <li><strong>No extra</strong> <code>torch._inductor.config</code> / <code>torch.compile</code> flags. <em>Exception</em>: <code>coordinate_descent_tuning</code> allowed on Medium.</li>
+  <li><strong>Must beat</strong> prior record on same hardware (8&times;H100, PrimeIntellect).</li>
+  <li>Discretionary: don&rsquo;t tank readability for tiny gains; don&rsquo;t consume the ~0.001&ndash;0.002 loss buffer below target.</li>
+</ol>
+Otherwise: anything goes.
+</div>
+
+<h3>Expanded notes</h3>
+
+<p><strong>The objective is mathematical.</strong> From the README: &ldquo;the goal is to obtain a probability model of language which assigns a probability of at least <code>math.exp(-3.28 * 10485760)</code> to the first 10,485,760 tokens of the FineWeb valset.&rdquo; Any architecture producing a valid joint probability over those tokens is admissible.</p>
+
+<p><strong>What this allows:</strong></p>
+<ul>
+  <li>Arbitrary changes to <code>num_layers</code>, <code>model_dim</code>, <code>num_heads</code>, <code>head_dim</code></li>
+  <li>Different activation functions, normalization schemes, gating</li>
+  <li>Different attention mechanisms (already used: FA3, long-short sliding window, paired-head)</li>
+  <li>Non-transformer architectures in principle (Mamba/SSM, RWKV, MoE, diffusion text models &mdash; though wallclock-competitive realization is very hard)</li>
+  <li>Multiple training passes with varying seq lengths (already done: schedule of 896 &rarr; 2048)</li>
+  <li>Multi-token prediction, auxiliary losses, curriculum, batch-size schedule (all already used)</li>
+  <li>Whatever optimizer you want (Muon currently dominates; alternatives are fair game)</li>
+</ul>
+
+<p><strong>What this excludes:</strong></p>
+<ul>
+  <li>Changing the tokenizer (the TokenMonster rejection) &mdash; vocab is fixed at GPT-2 BPE, 50,257 tokens (padded to 50,304)</li>
+  <li>Re-tokenizing val or training on extra/different tokens</li>
+  <li>Validating on a subset of the val set</li>
+  <li>Test-time-training / parameter updates during eval with untimed backward passes (the @samacqua rejection)</li>
+  <li>Output distributions that don&rsquo;t cover all 50,257 vocab IDs</li>
+</ul>
+
+<p><strong>No minimum speedup.</strong> A 5ms record is technically valid. But the discretionary rules cap how much code complexity is acceptable per ms (200 lines for 300ms: yes; 500 lines for 50ms: probably not), and protect the maintainer&rsquo;s 0.001&ndash;0.002 loss buffer below the target so that validation runs remain cheap.</p>
+
+<h2 id="hardware">3. Hardware &amp; Where the Time Goes</h2>
+
+<p>Official runs: 8 &times; H100 SXM5 on PrimeIntellect. Per-GPU: ~989 BF16 TFLOPs, ~1979 FP8 TFLOPs, 80 GB HBM3 at 3.35 TB/s, NVLink at ~900 GB/s. Aggregate: ~8 PFLOPs BF16 / ~16 PFLOPs FP8.</p>
+
+<p>Current record: <strong>~1.41 min</strong> on Track 1 (~84 s, ~1480 steps). Total training tokens: ~393 M (less than 1 epoch of the 10B FineWeb subset). The whole speedrun has been a <em>data-efficiency</em> competition: same val set, fewer tokens used.</p>
+
+<p><strong>Bottlenecks (from PR-level evidence and Akash&rsquo;s &ldquo;Profiling 101&rdquo; writeup, linked at record #44):</strong></p>
+
+<ul>
+  <li><strong>Model body (attention + MLP)</strong>: compute-bound. Hence FA3, sliding-window attention, fused <code>Linear&rarr;ReLU&sup2;&rarr;Linear</code> Triton kernel (record #59), FP8 matmul, mixed-precision Muon.</li>
+  <li><strong>Embedding &amp; LM head</strong>: bandwidth-bound. 50,304&times;768 matrices touched twice per step. Hence FP8 head, asymmetric rescale, softcap fusion, sparse bigram gradients.</li>
+  <li><strong>Gradient all-reduce</strong>: NVLink-bound. Multiple records (22, 23, 24) improved this: reduce_scatter, async overlap, sparse for bigram.</li>
+  <li><strong>Optimizer step</strong>: distributed Muon, Polar Express (replaces Newton-Schulz), batched/fused Adam, interweaved Adam/Muon.</li>
+</ul>
+
+<p>The model body fits comfortably in HBM (~250 MB in BF16 for 125M params). The benchmark is <em>not</em> memory-capacity-bound, so techniques like layer-weight sharing (ALBERT-style) don&rsquo;t help &mdash; they save params but not FLOPs.</p>
+
+<h3>Current training schedule</h3>
+
+<table>
+<tr><th>Stage</th><th>Fraction</th><th>seq_len</th><th>batch (tokens)</th><th>attn windows (blocks)</th><th>lr &times;</th></tr>
+<tr><td>1</td><td>1/3</td><td>896</td><td>131,072</td><td>(1, 3)</td><td>1.0</td></tr>
+<tr><td>2</td><td>1/3</td><td>2048</td><td>262,144</td><td>(3, 7)</td><td>1.52</td></tr>
+<tr><td>3</td><td>1/3</td><td>2048</td><td>393,216</td><td>(5, 11)</td><td>1.73</td></tr>
+<tr><td>extension</td><td>40 steps</td><td>2048</td><td>393,216</td><td>(6, 13)</td><td>&mdash;</td></tr>
+</table>
+
+<p>Total: 1480 steps. Architecture: 11 layers (one fewer than nominal GPT-2 Small), 6 heads, head_dim 128, model_dim 768. Plus a bigram hash embedding (vocab &times; 5) and 5 value-embedding tables.</p>
+
+<h3>Local development on RTX 5060 Ti 16 GB</h3>
+
+<p>Useful for: code correctness, regression tests after refactors, scaled-down training to validate convergence, kernel correctness checks, profiling shapes. Not useful for: representative wallclock, multi-GPU code paths (NCCL, reduce_scatter, sharded Muon), full sequence length (64K via FlexAttention), full batch sizes. Workflow: iterate locally on a <code>--nproc_per_node=1</code> scaled-down config &rarr; push to a single H100 for sanity check &rarr; only use 8&times;H100 PrimeIntellect for timing/significance.</p>
+
+<h2 id="workflow">4. Workflow &amp; Infrastructure</h2>
+
+<h3>Private mirror</h3>
+
+<p>GitHub does not support marking a fork of a public repo as private. Workaround: created a private repo <code>aaholmes/nanogpt</code>, mirror-pushed from upstream, added <code>KellerJordan/modded-nanogpt</code> as <code>upstream</code> remote. Sync via:</p>
+
+<pre><code>git fetch upstream
+git merge upstream/master  # from master, will be fast-forward
+</code></pre>
+
+<p>Optional &mdash; restrict upstream fetch to only master (avoid pulling all experimental upstream branches):</p>
+
+<pre><code>git config remote.upstream.fetch '+refs/heads/master:refs/remotes/upstream/master'
+</code></pre>
+
+<p>When ready to submit a record: create a public fork on GitHub, push the branch there, open PR.</p>
+
+<div class="warn">
+<strong>Security note:</strong> a Personal Access Token was previously embedded in the <code>origin</code> remote URL in cleartext. That token must be rotated at <a href="https://github.com/settings/tokens">github.com/settings/tokens</a>. Going forward, use a credential helper instead of embedded tokens:
+<pre><code>git remote set-url origin https://github.com/aaholmes/nanogpt.git
+git config --global credential.helper osxkeychain
+</code></pre>
+Or use the <code>gh</code> CLI (<code>gh auth login</code>). Prefer fine-grained PATs scoped to a single repo with minimal permissions.
+</div>
+
+<h3>Cost model</h3>
+
+<table>
+<tr><th>Track</th><th>Training time</th><th>+ compile (cold)</th><th>Per-run cost @ ~$18/h</th><th>p&lt;0.01 validation (~8&ndash;20 runs)</th></tr>
+<tr><td>Small</td><td>~1.4 min</td><td>~5&ndash;7 min</td><td>~$2&ndash;3</td><td>~$20&ndash;60</td></tr>
+<tr><td>Medium</td><td>~17.4 min</td><td>~5&ndash;7 min</td><td>~$7&ndash;8</td><td>~$60&ndash;160</td></tr>
+</table>
+
+<p>Exploration burns far more than validation. Budget realistically. For cheaper exploration: Lambda, RunPod, Vast.ai, Together, CoreWeave. Final timing/validation must be on PrimeIntellect to match the reference hardware.</p>
+
+<h2 id="landscape">5. Strategic Landscape: Track 1 vs Track 2</h2>
+
+<table>
+<tr><th></th><th>Track 1 (Small, &le;3.28)</th><th>Track 2 (Medium, &le;2.92)</th></tr>
+<tr><td>Current record</td><td>1.406 min (record #80, Apr 8 2026)</td><td>17.35 min (record #18, Dec 31 2025)</td></tr>
+<tr><td>Records in last 6 months</td><td>~27 (Jan&ndash;Apr 2026)</td><td>0</td></tr>
+<tr><td>Per-run cost</td><td>$2&ndash;3</td><td>$7&ndash;8</td></tr>
+<tr><td>Competitive pressure</td><td>Very high (many strong contributors, AI systems)</td><td>Low (most contributors focus on Small)</td></tr>
+<tr><td>Open features</td><td>Tightly contested; sub-second wins</td><td>Roadmap explicitly published by bulk-transfer author</td></tr>
+<tr><td><code>coordinate_descent_tuning</code></td><td>Banned</td><td><strong>Allowed but not yet used</strong></td></tr>
+</table>
+
+<p><strong>Key insight from <code>records/track_2_medium/2025-12-31_BulkSmallTrackTransfer/README.md</code>:</strong> the bulk-transfer author explicitly lists Medium-track features not yet integrated (Snoo, EMA wrapper, Smear-MTP, sharded mixed-precision Muon, cubic sliding window, Medium-specific logit scaling, <code>coordinate_descent_tuning</code>), and notes &ldquo;the learning rate, weight decay, and schedules can be improved.&rdquo; They did only <em>2 validation runs</em> and said &ldquo;this is well below the cutoff and can likely drop another 100 steps.&rdquo;</p>
+
+<p>Plus ~27 Track 1 records have shipped since 12/31/25 and none have been ported.</p>
+
+<p><strong>Implication:</strong> Track 2 is the higher-leverage starting point for a portfolio project. Lower competition, explicit roadmap, more headroom. Costs more per run but the slack is much larger. Track 1 should be reserved for narrow, high-conviction systems contributions.</p>
+
+<h2 id="ideas">6. Ideas Ranked by Leverage</h2>
+
+<p>Ranking criteria: (likely impact) &times; (probability of working) / (cost &amp; complexity). Each idea is annotated with why it&rsquo;s where it is. Phase-1 quality experiments at reduced scale on the local 5060 Ti are essentially free; rankings reflect total cost-to-conclusion including phase 2 (single H100) and phase 3 (8&times;H100 validation).</p>
+
+<h3>Tier A: Most worth attempting first</h3>
+
+<table>
+<tr><th>#</th><th>Idea</th><th>Why it ranks here</th></tr>
+<tr><td>A1</td><td><strong>TriLU activation experiment</strong> (see Section 7).</td>
+  <td>Three-piece piecewise polynomial activation (zero, quadratic, identity) with 2&ndash;3 learnable parameters per layer. Tracks GELU within ~0.05 max error at near-ReLU&sup2; cost. Cleanest possible test of the hypothesis that ReLU&sup2; won this codebase on cost, not shape. <strong>Deploy Track 1 first</strong> (cheaper iteration, stronger validation), then Track 2 (paired with A2). Plausibly clears records on both. Phase 1 essentially free (local single-GPU); Track 1 validation ~$20&ndash;60; Track 2 validation ~$60&ndash;160.</td></tr>
+<tr><td>A2</td><td><strong>Enable <code>coordinate_descent_tuning</code> on Track 2.</strong></td>
+  <td>Explicitly allowed in the rules but never tried. The bulk-transfer author flagged it: &ldquo;Presumably this is helpful. I didn&rsquo;t notice this flag until I did the two runs.&rdquo; Near-zero engineering work; might itself clear a record. Bundles naturally with A1&rsquo;s Track 2 phase but also viable standalone if A1 doesn&rsquo;t pan out on Track 1.</td></tr>
+<tr><td>A3</td><td><strong>Systematic Track 1 &rarr; Track 2 port study.</strong></td>
+  <td>The bulk-transfer author wrote: &ldquo;I have no scaling intuition yet.&rdquo; The empirical question &ldquo;which speedrun tricks transfer from 125M to 350M, and which don&rsquo;t&rdquo; is unanswered and publishable <em>with or without</em> a record. Strong learning value and the most natural portfolio centerpiece. Combine: port unported features, retune schedules, ablate.</td></tr>
+<tr><td>A4</td><td><strong>Schedule retune at Medium scale.</strong></td>
+  <td>The bulk-transfer used &ldquo;first guesses&rdquo; for LR, WD, cooldown frac, batch-size ramp. Sweeps at small N can be done cheaply (1 H100). Likely to compose with A2 and A3.</td></tr>
+</table>
+
+<h3>Tier B: Strong but slower payoff</h3>
+
+<table>
+<tr><th>#</th><th>Idea</th><th>Why it ranks here</th></tr>
+<tr><td>B1</td><td><strong>Gated MLP variants (SwiGLU, GeGLU, ReGLU).</strong></td>
+  <td>Standard in Llama, Mistral, and most modern open LLMs &mdash; conspicuously absent from modded-nanogpt. Requires a fused kernel to be wallclock-competitive (because the baseline has a fused <code>Linear&rarr;ReLU&sup2;&rarr;Linear</code> kernel). 2&ndash;3 days of kernel work but likely lasting impact. Natural follow-up if TriLU shows that activation shape matters.</td></tr>
+<tr><td>B2</td><td><strong>Port specific Track 1 records to Track 2 one-by-one.</strong></td>
+  <td>Candidates (in approximate descending value):
+    <ul style="margin: 0.3em 0;">
+      <li>Backout / single-activation last attn layers</li>
+      <li>NorMuon &amp; cautious weight decay</li>
+      <li>Multi-token prediction with proper schedule</li>
+      <li>Bigram hash embedding</li>
+      <li>Asymmetric logit rescale</li>
+      <li>Paired-head attention</li>
+      <li>FP8 lm_head (the bulk-transfer dropped it; retuning the scales could bring it back)</li>
+    </ul>
+    Each is a clean unit of work with a clean ablation. Risk: maintainer may queue a bulk transfer instead of merging individually &mdash; <strong>open a GH Discussion first</strong> to confirm intent.</td></tr>
+<tr><td>B3</td><td><strong>Snoo &amp; EMA optimizer wrappers</strong> (Track 2-specific records #12&ndash;14).</strong></td>
+  <td>Already proven on Medium pre-bulk-transfer, but the post-bulk codebase doesn&rsquo;t have them. Reintegration + retuning should yield record. Modest engineering; algorithmic risk is low.</td></tr>
+</table>
+
+<h3>Tier C: Worth considering, more speculative</h3>
+
+<table>
+<tr><th>#</th><th>Idea</th><th>Why it ranks here</th></tr>
+<tr><td>C1</td><td><strong>Sharded mixed-precision Muon</strong> (from Medium record 7).</strong></td>
+  <td>Was on the original Medium track, dropped in bulk transfer. Brings back a significant win, but reimplementation against the current code structure is non-trivial.</td></tr>
+<tr><td>C2</td><td><strong>Cubic sliding-window schedule</strong> (from Medium record 8).</strong></td>
+  <td>The bulk-transfer used a guess. FA3 needs to compile each window size, so the schedule needs to balance compile overhead against the curve. Phase-1 testable.</td></tr>
+<tr><td>C3</td><td><strong>Medium-specific logit-scaling formula.</strong></td>
+  <td>Was tuned for Medium pre-bulk; current code uses Small&rsquo;s. Cheap to study, modest payoff.</td></tr>
+<tr><td>C4</td><td><strong>Activation/init/softcap co-tuning.</strong></td>
+  <td>The interesting frontier in activations isn&rsquo;t the activation alone &mdash; it&rsquo;s coordinated retuning of init scales, softcap value, FP8 quant scales <em>around</em> the activation. Most prior activation tweaks didn&rsquo;t do this; if you do, you may unlock a small but real bounded-activation regime that doesn&rsquo;t exist in the current code.</td></tr>
+</table>
+
+<h3>Tier D: Long shots; only attempt if specifically motivated</h3>
+
+<table>
+<tr><th>#</th><th>Idea</th><th>Why it ranks here</th></tr>
+<tr><td>D1</td><td><strong>Mamba/SSM/RWKV replacement architecture.</strong></td>
+  <td>Allowed by rules but must beat the transformer + Muon + FP8 + FA3 + sliding-window stack on wallclock to 3.28 (or 2.92) loss in &lt;1.5 min (or &lt;17 min). No exotic architecture has done this yet despite years of trying. <a href="https://github.com/BlinkDL/modded-nanogpt-rwkv">BlinkDL&rsquo;s RWKV fork</a> exists but isn&rsquo;t on the leaderboard. Research-grade project.</td></tr>
+<tr><td>D2</td><td><strong>Diffusion-based language model.</strong></td>
+  <td>Must produce a tight ELBO-derived lower bound on <code>log P(x)</code> &le; target, with total inference + training cost beating the AR baseline. Both halves are open research problems. Not a starting project.</td></tr>
+<tr><td>D3</td><td><strong>Layer-weight sharing (ALBERT/Universal Transformer style).</strong></td>
+  <td>Saves parameter count but not FLOPs. Model already fits in HBM; param count isn&rsquo;t the bottleneck. Empirically has not won at this scale in modern LLM literature.</td></tr>
+<tr><td>D4</td><td><strong>Mixture-of-Depths / early-exit.</strong></td>
+  <td>Saves FLOPs proportional to skip rate. Conceptually appealing but very hard to make wallclock-positive at 125M scale (overhead of routing kills savings). Could be promising at Medium.</td></tr>
+<tr><td>D5</td><td><strong>Test-time training / parameter nudging during eval.</strong></td>
+  <td>Already proposed (@samacqua, PR #205) and explicitly disallowed: &ldquo;we are not allowing untimed backward passes.&rdquo; If you do it, the backward passes count toward wallclock &mdash; almost certainly net negative on this benchmark.</td></tr>
+</table>
+
+<h3>Recommended sequence (concrete)</h3>
+
+<ol>
+  <li><strong>Weekend 0</strong>: read <code>train_gpt.py</code> and <code>train_gpt_medium.py</code> end to end. Walk through the last 10 record PRs. Sketch a tensor-shape diagram of one forward pass. No GPU spend.</li>
+  <li><strong>Week 1</strong>: clone the Track 1 record code, get it running locally at scaled-down config, validate correctness against single-H100 rented for a few hours. Start TriLU Phase 1 on local 5060 Ti in parallel &mdash; it&rsquo;s essentially free compute.</li>
+  <li><strong>Week 2</strong>: TriLU Phase 2 (fused kernel) on single rented H100. If Phase 1 quality looks good, this is the main engineering effort. In parallel: open a Track 2 discussion thread to coordinate with maintainer; start preparing the Track 2 schedule retune (A4) and <code>coordinate_descent_tuning</code> harness (A2) so they&rsquo;re ready to bundle once TriLU is validated on Track 1.</li>
+  <li><strong>Week 3</strong>: TriLU Phase 3a (Track 1 validation, p&lt;0.01). Simultaneously prepare Track 2 PR with A1 + A2 + retuned schedule (A4) bundled. Goal: submit Track 1 PR and have Track 2 PR ready within 24&ndash;48 hours of merge.</li>
+  <li><strong>Week 4</strong>: TriLU Phase 3b (Track 2 validation with A1+A2+A4 bundle). Submit Track 2 PR. Maximize the chance of holding both records in the same window.</li>
+  <li><strong>Weeks 5+</strong>: A3 (port study) as the longer-arc writeup project. B-tier work conditional on results. B1 (gated MLPs) is the natural follow-up if TriLU shows activation shape matters; B2 / B3 if the port study has identified concrete missing pieces.</li>
+</ol>
+
+<p>Total realistic budget for one record attempt (validation included): <strong>$300&ndash;800</strong> if you stay disciplined; <strong>$1500+</strong> if exploration drags. Single-H100 sweeps (Lambda/RunPod) are 5&ndash;10&times; cheaper than 8&times;H100 PrimeIntellect for the same wallclock and should be used aggressively for everything except final timing.</p>
+
+<h2 id="activation">7. Detailed Plan: TriLU Activation Function Experiment</h2>
+
+<h3>The TriLU activation family</h3>
+
+<p><strong>TriLU</strong> (Three-piece Linear Unit) is a piecewise polynomial activation function with three regions: zero, quadratic, identity. Continuous (C&deg;), with the transitions to the flat and linear pieces happening at learnable breakpoints. The general form has three parameters:</p>
+
+<pre><code>             ┌  0                                  if x &le; L
+TriLU(x;L,R,&alpha;) = ┤  &alpha;(x&minus;L)(x&minus;R) + R(x&minus;L)/(R&minus;L)        if L &lt; x &lt; R
+             └  x                                  if x &ge; R
+</code></pre>
+
+<p>Equivalent to <code>&alpha;x&sup2; + &beta;x + &gamma;</code> in the middle, with <code>&beta; = R/(R&minus;L) &minus; &alpha;(L+R)</code> and <code>&gamma; = &alpha;LR &minus; LR/(R&minus;L)</code>.</p>
+
+<p>Two named special cases used in this plan:</p>
+
+<ul>
+  <li><strong>Symmetric TriLU</strong>: <code>L = &minus;a, R = +a</code>, curvature renamed <code>&kappa;</code>. Two parameters per layer.</li>
+  <li><strong>TriLU</strong> (asymmetric, full 3-parameter form): independent <code>L</code>, <code>R</code>, <code>&alpha;</code>.</li>
+</ul>
+
+<p>Useful limits:</p>
+<ul>
+  <li><code>&alpha; = 0</code>: piecewise linear &mdash; the &ldquo;ramp-on&rdquo; activation</li>
+  <li><code>&alpha; = 1/(4a)</code> in the symmetric case: recovers the C&sup1; Huber smooth-ReLU</li>
+  <li><code>&alpha; &gt; 1/(4a)</code>: GELU-like underbite (middle quadratic dips slightly negative before re-entering zero)</li>
+  <li>Minimax-best GELU fit: <code>L &asymp; &minus;1.91, R &asymp; +1.91, &alpha; &asymp; 0.247</code></li>
+</ul>
+
+<h3>Motivation</h3>
+
+<p>ReLU&sup2; (<code>max(0, x)&sup2;</code>) has held the activation slot in modded-nanogpt since October 2024 (record #5). Properties:</p>
+
+<ul>
+  <li>Found via architecture search in Primer (So et al. 2021), matches GELU at lower FLOPs cost</li>
+  <li>No transcendentals; trivially fusable into a Triton kernel (record #59 fuses <code>Linear&rarr;ReLU&sup2;&rarr;Linear</code>)</li>
+  <li>Non-negative outputs; sparse-ish activations</li>
+  <li><strong>Unbounded</strong> &mdash; grows quadratically for large positive <code>x</code></li>
+</ul>
+
+<p>The unboundedness is a real concern: it&rsquo;s the kind of thing that forces careful init scaling, logit softcap, and FP8 dynamic-range management in the rest of the codebase. A bounded-slope alternative could in principle simplify the surrounding scaffolding (and pair well with C4 above).</p>
+
+<h3>Cost and parameterization</h3>
+
+<p>TriLU cost vs ReLU&sup2;: ~4&ndash;5 ops/element vs 2 (two extra compares for the asymmetric form, one extra multiply, one extra add). Parameter count: 2 per layer (symmetric) or 3 per layer (asymmetric), optionally per-channel. All negligible.</p>
+
+<p>Soft-positivity for the breakpoint magnitudes:</p>
+
+<pre><code># symmetric TriLU
+a     = F.softplus(theta_a) + eps    # transition half-width &gt; 0
+kappa = F.softplus(theta_k)          # curvature &ge; 0
+
+# asymmetric TriLU
+L     = -F.softplus(theta_L) - eps   # left breakpoint &lt; 0
+R     =  F.softplus(theta_R) + eps   # right breakpoint &gt; 0
+alpha = F.softplus(theta_a)          # curvature &ge; 0
+</code></pre>
+
+<p>Initialize at the minimax-fit GELU values (see initialization options below) and let the optimizer drift. Per-layer learnable scalars by default; consider per-channel as a follow-up if per-layer shows meaningful inter-layer variation.</p>
+
+<p>Use a <strong>separate, smaller learning rate</strong> for the activation parameters &mdash; typically 0.1&times; the main LR. This is standard practice for scalar learned parameters (layer-norm scales, learned positional embeddings, log-variance in VAEs, etc.) and prevents the activation shape from being jerked around by the optimizer chasing weight updates.</p>
+
+<h3>Layer weight initialization</h3>
+
+<p>Distinct from activation parameter initialization: this is about how the MLP weights <code>W&#8321;</code>, <code>W&#8322;</code> are drawn.</p>
+
+<p>Standard practice for various activations:</p>
+
+<table>
+<tr><th>Activation</th><th>Standard init</th><th>Gain</th><th>Notes</th></tr>
+<tr><td>ReLU</td><td>Kaiming / He</td><td>&radic;2 &asymp; 1.414</td><td><code>std = &radic;(2/fan_in)</code>; compensates for ReLU zeroing half the inputs</td></tr>
+<tr><td>GELU</td><td>Kaiming-like</td><td>~&radic;2</td><td>Effectively same as ReLU; smooth tail has small variance effect</td></tr>
+<tr><td>Tanh / Sigmoid</td><td>Xavier / Glorot</td><td>1 (or 5/3 for tanh)</td><td><code>std = &radic;(1/fan_in)</code></td></tr>
+<tr><td>ReLU&sup2;</td><td><em>No closed-form standard</em></td><td>n/a</td><td>Output variance scales as &sigma;&#8308; not &sigma;&sup2;, so Kaiming-style variance analysis breaks. Codebases typically rely on normalization + softcap + zero-init projections to control scales.</td></tr>
+<tr><td><strong>TriLU at GELU-fit init</strong></td><td><strong>Same as GELU (Kaiming, gain &radic;2)</strong></td><td>&radic;2</td><td>The function tracks GELU within &plusmn;0.05; variance analysis follows GELU&rsquo;s.</td></tr>
+</table>
+
+<p><strong>The codebase&rsquo;s actual init</strong>: <code>std = 0.5 &times; model_dim<sup>-0.5</sup></code> (see <code>train_gpt.py:1205</code>), which is <em>smaller</em> than vanilla Kaiming. The modded-nanogpt init has co-evolved with ReLU&sup2; + softcap + zero-init residual projections + various scaling banks. The init isn&rsquo;t load-bearing on the activation choice alone &mdash; it&rsquo;s load-bearing on the surrounding scaffolding.</p>
+
+<p><strong>Recommendation for TriLU Phase 1</strong>: keep the existing codebase init unchanged. Don&rsquo;t change two things at once. After Phase 1 establishes TriLU&rsquo;s viability, run a small init sweep in Phase 2:</p>
+
+<ul>
+  <li><code>0.5 &times; model_dim<sup>-0.5</sup></code> (current codebase value)</li>
+  <li><code>&radic;2 &times; model_dim<sup>-0.5</sup></code> (vanilla Kaiming for GELU)</li>
+  <li><code>0.7 &times; model_dim<sup>-0.5</sup></code> (split the difference)</li>
+</ul>
+
+<p>This is part of the Tier C4 &ldquo;co-tuning&rdquo; angle: if TriLU&rsquo;s GELU-like shape rewards a different init than ReLU&sup2;&rsquo;s unbounded shape did, that&rsquo;s where the extra leverage lives.</p>
+
+<h3>Phase 1: Quality comparison (single GPU, unfused, ~$5&ndash;20)</h3>
+
+<p>Run all variants at reduced scale on a single H100 (or even 5060 Ti locally if memory permits). <strong>Same hyperparameters</strong>, same init scheme (modulo activation), same seed sweep (5 seeds).</p>
+
+<p>Variants:</p>
+
+<ol>
+  <li><strong>ReLU&sup2;</strong> (baseline)</li>
+  <li><strong>C&sup1; smooth-ReLU</strong>: 1 learnable param (<code>a</code>), symmetric TriLU with <code>&kappa;</code> pinned to <code>1/(4a)</code></li>
+  <li><strong>Symmetric TriLU</strong>: 2 learnable params per layer (<code>a, &kappa;</code>); breakpoints at <code>&plusmn;a</code>, learnable curvature.</li>
+  <li><strong>TriLU</strong> (asymmetric): 3 learnable params per layer (<code>L, R, &alpha;</code>); independent left and right breakpoints, learnable curvature. <em>Primary candidate.</em></li>
+  <li><strong>SwiGLU</strong>: standard gated MLP as a control from the &ldquo;serious modern alternative&rdquo; bucket (note: this requires structural changes to the MLP, not just an activation swap)</li>
+  <li><strong>PReLU&sup2;</strong>: <code>max(0,x)&sup2; + &alpha;&middot;min(0,x)&middot;|x|</code> with learnable <code>&alpha;</code> &mdash; cheap control variant on the negative side</li>
+</ol>
+
+<h4>Strategic motivation: TriLU at GELU-fit init</h4>
+
+<p><strong>The right framing isn&rsquo;t &ldquo;TriLU vs. symmetric TriLU.&rdquo; The right framing is TriLU (or symmetric TriLU) initialized to approximate GELU vs. ReLU&sup2;.</strong></p>
+
+<div class="good">
+<strong>The strategic case:</strong>
+<ul>
+  <li>ReLU&sup2; was selected in this codebase (record #5) primarily because it&rsquo;s <em>cheaper</em> than GELU, not because it was demonstrably better-shaped. GELU was the prior standard.</li>
+  <li>Modern LLMs (Llama, Mistral, GPT-4 family) overwhelmingly use GELU or SwiGLU. ReLU&sup2; is a niche choice driven by the wallclock objective of this benchmark.</li>
+  <li>TriLU at the minimax-fit init <code>(L = &minus;1.91, R = +1.91, &alpha; = 0.247)</code> tracks GELU within <strong>max error 0.053 / RMS 0.029</strong> &mdash; essentially indistinguishable from GELU in any reasonable activation distribution.</li>
+  <li>Cost: ~5 ops/element vs ReLU&sup2;&rsquo;s ~2. Inside the fused MLP kernel, activation cost is a small fraction (~2&ndash;5%) of matmul cost. The wallclock overhead is ~1&ndash;3% per MLP block.</li>
+  <li>If GELU&rsquo;s shape gives <em>any</em> quality improvement over ReLU&sup2; (fewer steps to target), the net wallclock should be positive.</li>
+</ul>
+This is the cleanest possible test of the hypothesis &ldquo;ReLU&sup2; won this codebase on cost, not shape.&rdquo;
+</div>
+
+<p>Visual comparison vs ReLU&sup2;:</p>
+
+<p><img src="img/gelu_vs_variant4.png" alt="GELU vs TriLU (GELU-fit init) vs ReLU²" style="max-width: 100%; border: 1px solid var(--border); border-radius: 5px;"></p>
+
+<p>TriLU at GELU-fit init tracks GELU within &plusmn;0.07 across <code>[&minus;4, 4]</code> (this plot shows the L&sup2; fit; the minimax fit reduces max error to 0.053). ReLU&sup2; has no negative-side dip and grows quadratically rather than linearly &mdash; RMS error to GELU is <strong>~140&times; larger than TriLU&rsquo;s</strong>.</p>
+
+<h4>Symmetric vs. asymmetric: an empirical finding</h4>
+
+<p>The L&sup2; (and minimax) best fit of TriLU to GELU is exactly symmetric (<code>L = &minus;R</code>). The reason: GELU satisfies <code>GELU(0) = 0</code> with slope <code>1/2</code> at the origin; when <code>L = &minus;R</code> in the TriLU family, the linear coefficient <code>&beta;</code> is forced to exactly <code>1/2</code>, so any best-fit through <code>(0, 0)</code> with slope <code>1/2</code> lands symmetric.</p>
+
+<p>So <strong>for the GELU-init starting point, asymmetric TriLU and symmetric TriLU are equivalent</strong>. The asymmetric form&rsquo;s extra degree of freedom matters only if the network drifts to asymmetric breakpoints during training. Run both as separate experiments &mdash; if TriLU&rsquo;s trained <code>(L, R)</code> stay symmetric, symmetric TriLU was sufficient; if not, the third parameter pays for itself.</p>
+
+<h4>Initialization options</h4>
+
+<ul>
+  <li><strong>GELU-fit init (minimax, recommended):</strong> symmetric TriLU at <code>a = 1.910, &kappa; = 0.247</code>; TriLU at <code>L = &minus;1.910, R = +1.910, &alpha; = 0.247</code>. Minimizes worst-case deviation from GELU: max abs error 0.053, RMS error 0.029.</li>
+  <li><strong>GELU-fit init (L&sup2;/RMS):</strong> symmetric TriLU at <code>a = 1.749, &kappa; = 0.275</code>; TriLU at <code>L = &minus;1.749, R = +1.749, &alpha; = 0.275</code>. Lower RMS (0.025) but higher worst-case (0.070).</li>
+  <li><strong>C&sup1; init:</strong> symmetric TriLU at <code>a = 1, &kappa; = 0.25</code>; TriLU at <code>L = &minus;1, R = 1, &alpha; = 0.25</code>. Starts at the smooth (no-kink) point.</li>
+  <li><strong>ReLU init:</strong> symmetric TriLU at small <code>a</code> (e.g. 0.1), TriLU at small <code>R&minus;L</code>. Starts close to ReLU with a narrow smoothing region.</li>
+</ul>
+
+<p><strong>Use the minimax-fit init by default.</strong> For function approximation, L&sup2; (RMS) is the wrong objective &mdash; its statistical justification (MLE under Gaussian noise) doesn&rsquo;t apply when fitting a deterministic target. Minimax (Chebyshev) is the classical choice and bounds the worst-case deviation at any single <code>x</code>, which is the operationally relevant quantity for an activation function. The minimax fit reduces worst-case error by 24% relative to the L&sup2; fit, with the residual showing perfect equi-oscillation at 5 alternating extrema of magnitude &asymp;0.053.</p>
+
+<p>Visual comparison of L&sup2; vs L&infin; fits:</p>
+
+<p><img src="img/gelu_fit_L2_vs_Linf.png" alt="L² vs L∞ fits of TriLU to GELU" style="max-width: 100%; border: 1px solid var(--border); border-radius: 5px;"></p>
+
+<p>Track <code>(a, &kappa;)</code> or <code>(L, R, &alpha;)</code> trajectories over training to see what the network &ldquo;wants.&rdquo;</p>
+
+<p>Metrics:</p>
+
+<ul>
+  <li>Val loss vs step count (primary)</li>
+  <li>Val loss vs FLOPs (corrected for activation cost differences)</li>
+  <li>Training stability (loss spikes, gradient norms)</li>
+  <li>Convergence of learned <code>(a, &kappa;)</code> trajectory over training, per layer</li>
+</ul>
+
+<p>Diagnostic interpretation:</p>
+
+<ul>
+  <li>If TriLU at GELU-fit init <strong>beats</strong> ReLU&sup2; in steps-to-target &rarr; primary hypothesis confirmed (ReLU&sup2; won on cost, not shape). Proceed to Phase 2.</li>
+  <li>If TriLU at GELU-fit init <strong>ties</strong> ReLU&sup2; &rarr; ambiguous; the wallclock comparison in Phase 2 decides.</li>
+  <li>If TriLU <strong>loses</strong> &rarr; ReLU&sup2;&rsquo;s shape advantage (or unboundedness) is real. Stop here; the negative result is itself publishable.</li>
+  <li>If learned <code>&kappa;</code> stays near <code>1/(4a)</code> (the C&sup1; point) across all layers &rarr; smoothness mattered more than curvature. C&sup1; smooth-ReLU would have sufficed.</li>
+  <li>If learned <code>&kappa; &gt; 1/(4a)</code> consistently &rarr; network wants GELU-like underbite; investigate whether standard GELU/SiLU is comparable.</li>
+  <li>If learned <code>&kappa; &lt; 1/(4a)</code> &rarr; piecewise-linear regime (slopes <code>(0, &frac12;, 1)</code>) is preferred; simpler alternative exists.</li>
+  <li>If TriLU&rsquo;s trained <code>(L, R)</code> stay symmetric (<code>L &asymp; &minus;R</code>) &rarr; symmetric TriLU was sufficient; the third parameter is redundant.</li>
+  <li>If TriLU&rsquo;s trained <code>(L, R)</code> diverge (<code>L &ne; &minus;R</code>) &rarr; asymmetry matters; the third parameter pays for itself.</li>
+  <li>If different layers want different <code>(L, R, &alpha;)</code> &rarr; per-layer activations are publishable irrespective of record.</li>
+</ul>
+
+<h3>Phase 2: Fused kernel (single H100, ~$20&ndash;100)</h3>
+
+<p>For TriLU variants that beat or tie ReLU&sup2; in Phase 1, write a fused <code>Linear&rarr;TriLU&rarr;Linear</code> Triton kernel matching the existing record-#59 kernel. Key implementation notes:</p>
+
+<ul>
+  <li><code>(L, R, &alpha;)</code> (or <code>(a, &kappa;)</code> for symmetric) need to flow in as small extra tensors (per-layer or per-channel)</li>
+  <li>Backward needs the activation derivative; piecewise: <code>0</code> if <code>x &le; L</code>; <code>2&alpha;x + &beta;</code> if <code>L &lt; x &lt; R</code>; <code>1</code> if <code>x &ge; R</code> (where <code>&beta; = R/(R&minus;L) &minus; &alpha;(L+R)</code>)</li>
+  <li>Gradients w.r.t. <code>L, R, &alpha;</code> need to be accumulated across the batch&times;seq dimension</li>
+  <li>Stick with the existing kernel&rsquo;s tile sizes and SRAM layout; benchmark against ReLU&sup2; on identical input shapes</li>
+</ul>
+
+<p>Estimated effort: ~half a day to a day. Validate numerically against an unfused PyTorch reference.</p>
+
+<h3>Phase 3: Full validation (8&times;H100 PrimeIntellect)</h3>
+
+<p>Only if Phase 2 wallclock is within ~5% of ReLU&sup2;. The two-track deployment strategy below covers how this phase splits.</p>
+
+<h3>Track 1 vs Track 2 deployment strategy</h3>
+
+<p>Earlier framing said &ldquo;the experiment lives on Track 2.&rdquo; That was overcautious. Deploy <strong>Track 1 first, then Track 2 in rapid succession</strong>. Rationale:</p>
+
+<ul>
+  <li><strong>Track 1 iteration is 3&ndash;4&times; cheaper</strong>: $2&ndash;3/run vs $7&ndash;8/run. You can afford more exploratory runs to nail the right kernel tile sizes and init values.</li>
+  <li><strong>Track 1 validation is also cheaper</strong>: a full p&lt;0.01 sweep is ~$20&ndash;60 vs $60&ndash;160.</li>
+  <li><strong>A Track 1 record is much stronger validation of the technique.</strong> Track 1 is the actively contested track. Clearing it against <code>@classiclarryd</code> / <code>@YouJiacheng</code> / AI systems is a much harder signal to dismiss.</li>
+  <li><strong>The kernel is reusable.</strong> Same fused <code>Linear&rarr;TriLU&rarr;Linear</code> kernel transfers from Track 1 to Track 2; only the schedule and surrounding scaffolding need retuning.</li>
+</ul>
+
+<h4>Conditional probabilities (rough estimates)</h4>
+
+<table>
+<tr><th>Event</th><th>Estimated probability</th></tr>
+<tr><td>TriLU clears a Track 1 record on its own</td><td>20&ndash;40%</td></tr>
+<tr><td>Track 2 record conditional on Track 1 working (TriLU + A2 + A4)</td><td>70&ndash;90%</td></tr>
+<tr><td>Track 1 record holds long enough for you to ship Track 2 (1&ndash;2 weeks)</td><td>60&ndash;80%</td></tr>
+<tr><td><strong>Hold both records simultaneously</strong></td><td><strong>~10&ndash;30%</strong></td></tr>
+</table>
+
+<h4>Three risks to manage</h4>
+
+<div class="warn">
+<strong>1. Track 1&rsquo;s loss-buffer rule.</strong> Discretionary rule #2: &ldquo;The current record is intentionally kept roughly 0.001&ndash;0.002 loss below 3.28&hellip; If a PR substantially consumes this buffer, it should do so in a way that outperforms a simple step count decrease, when measured at equivalent loss.&rdquo;
+<p>What this means concretely: if TriLU&rsquo;s only benefit is &ldquo;converges to slightly lower loss in the same step count,&rdquo; that <em>consumes buffer</em> rather than gaining wallclock. To clear Track 1, TriLU must let you run <strong>fewer steps</strong> at the same loss, with the time savings exceeding the activation overhead. <em>Mitigation</em>: in the Track 1 PR, reduce step count to keep mean val loss at the same buffer distance from 3.28 as the current record, and demonstrate the time savings.</p>
+</div>
+
+<div class="warn">
+<strong>2. Someone races you to Track 2 once Track 1 lands.</strong> Track 1 PRs are public. AI systems (Hiverge, Locus, Aster) and active human contributors watch the repo. The kernel port to Track 2 is mechanical &mdash; a watcher could land it before you do.
+<p><em>Mitigation</em>: prepare the Track 2 submission <strong>in parallel</strong>. By the time the Track 1 PR opens, the Track 2 PR (with kernel + A2 + A4) should be ready to submit within 24&ndash;48 hours. The two PRs share most of the work; the marginal cost of preparing Track 2 alongside Track 1 is small.</p>
+</div>
+
+<div class="warn">
+<strong>3. Track 1 record falls before you ship Track 2.</strong> Track 1 records routinely fall in 1&ndash;3 weeks. If your Track 1 PR sits in review while a new record displaces yours, you lose the &ldquo;double record&rdquo; window.
+<p><em>Mitigation</em>: nothing structural; just move quickly. Track 2 still goes through on its own merits even if Track 1 falls.</p>
+</div>
+
+<h4>Phase 3 split by track</h4>
+
+<ol>
+  <li><strong>Phase 3a (Track 1, ~$20&ndash;60)</strong>: 8&ndash;15 trials at Track 1 config. Submit PR with reduced step count to address the buffer issue. <em>While this runs, prepare Phase 3b inputs.</em></li>
+  <li><strong>Phase 3b prep (single H100, ~$30&ndash;80)</strong>: in parallel with 3a, port the kernel to the Track 2 codebase, enable <code>coordinate_descent_tuning</code> (A2), retune the schedule (A4) via small single-H100 sweeps. Goal: Track 2 PR is ready by the time Phase 3a completes.</li>
+  <li><strong>Phase 3c (Track 2, ~$60&ndash;160)</strong>: 8&ndash;15 trials at Track 2 config with the A1+A2+A4 bundle. Submit PR within 24&ndash;48 hours of the Track 1 PR.</li>
+</ol>
+
+<h4>The most-likely-but-still-good outcome</h4>
+
+<p>Honest framing: the most likely outcome <em>isn&rsquo;t</em> the double record. It&rsquo;s that <strong>TriLU works on Track 2 but fails on Track 1</strong> &mdash; because Track 1&rsquo;s buffer is tight, activation overhead is barely covered by quality gain, and maintainers favor existing structure. In that scenario you still have:</p>
+
+<ul>
+  <li>A Track 2 record (strong portfolio item; Track 2 has been stagnant for 5+ months)</li>
+  <li>A clean writeup: &ldquo;TriLU at GELU-fit init: tested on Track 1 (didn&rsquo;t clear, here&rsquo;s the analysis), worked on Track 2 (record + per-layer ablation)&rdquo;</li>
+  <li>An honest empirical contribution that engages with where the technique works and doesn&rsquo;t &mdash; arguably <em>more</em> publishable than a pure win</li>
+</ul>
+
+<p>So the failure mode is fine. Pursue the double-record upside but don&rsquo;t structure effort around it being the expected outcome.</p>
+
+<h3>Co-tuning option</h3>
+
+<p>If the bounded variant shows promise but doesn&rsquo;t quite clear the record, consider co-tuning the surrounding scaffolding (Tier C4 idea): re-evaluate init scales, logit softcap, FP8 quant scales <em>around</em> the new activation. The reason this hasn&rsquo;t worked for prior activation tweaks is precisely that the surrounding code is tuned for ReLU&sup2;&rsquo;s unboundedness. A bounded activation should let you tighten everything else.</p>
+
+<h2 id="risks">8. Risks &amp; Open Questions</h2>
+
+<h3>Risks</h3>
+
+<ul>
+  <li><strong>Maintainer queues bulk transfer.</strong> If you spend $200 on a feature port and the maintainer ships their own bulk update, your PR sits. <em>Mitigation:</em> open a GH Discussion before doing significant validation work. Frame as &ldquo;I&rsquo;m working on this; is it stepping on your roadmap?&rdquo;</li>
+  <li><strong>Track 2 validation cost compounds.</strong> Each idea you validate at Medium is $60&ndash;160. Three failed ideas burns half your budget. <em>Mitigation:</em> single-H100 Phase-2 testing for every idea before paying for 8&times;H100 Phase-3 validation.</li>
+  <li><strong>Not all Track 1 wins transfer.</strong> The bulk-transfer author noted &ldquo;some features included are probably detrimental and don&rsquo;t scale below 3.28 loss.&rdquo; <em>Mitigation:</em> ablate. Run with and without each ported feature. Treat negative results as findings.</li>
+  <li><strong>Muon orthogonalization makes activation scale non-absorbable.</strong> Adam can rescale weights to compensate for activation magnitude; Muon can&rsquo;t as freely. This means activation choices interact with the optimizer in ways that don&rsquo;t hold in Adam-only codebases. <em>Mitigation:</em> normalize activations explicitly; don&rsquo;t rely on absorption.</li>
+  <li><strong>Compile time eats iteration speed.</strong> <code>torch.compile</code> can take 5&ndash;7 minutes cold. Plan kernels and configs so compile artifacts amortize. Avoid rebuilding cached graphs unnecessarily.</li>
+  <li><strong>Inter-run variance is real.</strong> p&lt;0.01 isn&rsquo;t free &mdash; some changes look like records on a single run and wash out across seeds. Always run &ge;3 seeds before celebrating.</li>
+</ul>
+
+<h3>Open questions to resolve before significant spend</h3>
+
+<ul>
+  <li>Does the maintainer prefer individual Track 2 ports or another bulk transfer? (Ask on a GH Discussion.)</li>
+  <li>What&rsquo;s the standard practice for declaring a record &ldquo;systems-only&rdquo; (rule 3 exception)? (Read recent PRs that invoked it.)</li>
+  <li>How sensitive is Medium to FP8 lm_head scales? The bulk-transfer dropped FP8 head &ldquo;would take more effort to tune the coef.&rdquo; A few hours of tuning could bring it back.</li>
+  <li>How tight is the loss buffer on Track 2 currently? Need to check the bulk-transfer log to see how far the mean val loss is from 2.92.</li>
+  <li>What was the actual wallclock vs. compile-time split for record #80? Need to read the Phase 1 profiling output.</li>
+</ul>
+
+<div class="footer">
+Last updated: 2026-05-22.
+Source repo: <code>aaholmes/nanogpt</code> (private mirror of <code>KellerJordan/modded-nanogpt</code>).
+This document is a working strategy plan, not a commitment &mdash; revisit and revise as the project evolves.
+</div>
+
+</body>
+</html>
