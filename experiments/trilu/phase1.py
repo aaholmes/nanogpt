@@ -120,16 +120,25 @@ class TriLU(nn.Module):
 
 
 def make_activation(name: str, init: str = "gelu_minimax"):
-    """Factory that returns a fresh activation module each call."""
-    if name == "relu2":
+    """Factory that returns a fresh activation module each call.
+
+    For gated variants, returns the *inner* activation; the MLP class handles gating.
+    """
+    if name in ("relu2",):
         return ReLU2()
-    if name == "gelu":
+    if name in ("gelu", "geglu"):
         return nn.GELU()
-    if name == "trilu_sym":
+    if name == "swiglu":
+        return nn.SiLU()
+    if name in ("trilu_sym",):
         return TriLU(asymmetric=False, init=init)
-    if name == "trilu_asym":
+    if name in ("trilu_asym", "triglu"):
         return TriLU(asymmetric=True, init=init)
     raise ValueError(f"Unknown activation: {name}")
+
+
+# Activations that use gated MLP (3 matmuls, hidden dim = round(8/3 * model_dim))
+GATED_ACTIVATIONS = {"swiglu", "geglu", "triglu"}
 
 
 # -----------------------------------------------------------------------------
@@ -157,6 +166,8 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
+    """Standard transformer MLP: W2 . act(W1 . x). Used by relu2, gelu, trilu_*."""
+
     def __init__(self, dim: int, mlp_dim: int, activation: nn.Module):
         super().__init__()
         self.fc1 = nn.Linear(dim, mlp_dim, bias=False)
@@ -167,13 +178,39 @@ class MLP(nn.Module):
         return self.fc2(self.act(self.fc1(x)))
 
 
+class GatedMLP(nn.Module):
+    """Gated MLP (SwiGLU / GeGLU / TriGLU): W2 . ( act(W1.x) * (V.x) )."""
+
+    def __init__(self, dim: int, mlp_dim: int, activation: nn.Module):
+        super().__init__()
+        self.fc1 = nn.Linear(dim, mlp_dim, bias=False)
+        self.fc_gate = nn.Linear(dim, mlp_dim, bias=False)
+        self.fc2 = nn.Linear(mlp_dim, dim, bias=False)
+        self.act = activation
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc2(self.act(self.fc1(x)) * self.fc_gate(x))
+
+
+def make_mlp(dim: int, model_dim: int, act_name: str, act_init: str) -> nn.Module:
+    """Build an MLP block. Hidden dim chosen to match params: 4d for standard, (8/3)d for gated."""
+    act = make_activation(act_name, act_init)
+    if act_name in GATED_ACTIVATIONS:
+        # 8/3 * d, rounded to nearest multiple of 64 for hardware-friendliness
+        hidden = max(64, round(8 * model_dim / 3 / 64) * 64)
+        return GatedMLP(dim, hidden, act)
+    else:
+        hidden = 4 * model_dim
+        return MLP(dim, hidden, act)
+
+
 class Block(nn.Module):
-    def __init__(self, dim, num_heads, mlp_dim, activation):
+    def __init__(self, dim, num_heads, model_dim, act_name, act_init):
         super().__init__()
         self.ln1 = nn.LayerNorm(dim)
         self.attn = CausalSelfAttention(dim, num_heads)
         self.ln2 = nn.LayerNorm(dim)
-        self.mlp = MLP(dim, mlp_dim, activation)
+        self.mlp = make_mlp(dim, model_dim, act_name, act_init)
 
     def forward(self, x):
         x = x + self.attn(self.ln1(x))
@@ -182,13 +219,13 @@ class Block(nn.Module):
 
 
 class TinyGPT(nn.Module):
-    def __init__(self, vocab_size, num_layers, dim, num_heads, mlp_dim, seq_len, act_name, act_init):
+    def __init__(self, vocab_size, num_layers, dim, num_heads, seq_len, act_name, act_init):
         super().__init__()
         self.token_embed = nn.Embedding(vocab_size, dim)
         self.pos_embed = nn.Embedding(seq_len, dim)
-        # one activation instance per layer so TriLU has per-layer learnable params
+        # one MLP per layer; gated variants get their own hidden dim sized to match params
         self.blocks = nn.ModuleList([
-            Block(dim, num_heads, mlp_dim, make_activation(act_name, act_init))
+            Block(dim, num_heads, dim, act_name, act_init)
             for _ in range(num_layers)
         ])
         self.ln_f = nn.LayerNorm(dim)
@@ -299,7 +336,6 @@ def train_one(config, train_data, val_data, seed, device):
         num_layers=config["num_layers"],
         dim=config["dim"],
         num_heads=config["num_heads"],
-        mlp_dim=config["mlp_dim"],
         seq_len=config["seq_len"],
         act_name=config["activation"],
         act_init=config.get("init", "gelu_minimax"),
@@ -325,7 +361,7 @@ def train_one(config, train_data, val_data, seed, device):
         weight_decay=0.1,
     )
 
-    has_trilu = config["activation"].startswith("trilu")
+    has_trilu = config["activation"] in ("trilu_sym", "trilu_asym", "triglu")
     log = {"val_loss": [], "trilu_params": [], "wallclock": [], "config": config, "seed": seed}
 
     t0 = time.time()
@@ -368,19 +404,19 @@ def pick_device():
 
 CONFIGS = {
     "tiny": dict(  # fits on M2 Air in a few minutes; sanity check only
-        num_layers=3, dim=128, num_heads=4, mlp_dim=512,
+        num_layers=3, dim=128, num_heads=4,
         seq_len=256, batch_size=8,
         total_steps=300, warmup=30, eval_every=25,
         lr=3e-4, vocab_size=50304,
     ),
-    "default": dict(  # comfortable on 5060 Ti / A10, ~1hr per seed
-        num_layers=6, dim=384, num_heads=6, mlp_dim=1536,
+    "default": dict(  # comfortable on 5060 Ti / A10, ~40 min per seed
+        num_layers=6, dim=384, num_heads=6,
         seq_len=1024, batch_size=16,
-        total_steps=1500, warmup=100, eval_every=50,
+        total_steps=1000, warmup=80, eval_every=50,
         lr=3e-4, vocab_size=50304,
     ),
     "medium": dict(  # bigger, for H100; ~3hr per seed
-        num_layers=8, dim=512, num_heads=8, mlp_dim=2048,
+        num_layers=8, dim=512, num_heads=8,
         seq_len=1024, batch_size=32,
         total_steps=3000, warmup=200, eval_every=100,
         lr=3e-4, vocab_size=50304,
@@ -388,7 +424,11 @@ CONFIGS = {
 }
 
 
-DEFAULT_ACTIVATIONS = ["relu2", "gelu", "trilu_sym", "trilu_asym"]
+ALL_ACTIVATIONS = ["relu2", "gelu", "trilu_sym", "trilu_asym", "swiglu", "geglu", "triglu"]
+
+# Default 6-activation sweep covering the standard/gated x ReLU-like/GELU-like/TriLU comparison.
+# At 1000 steps, 3 seeds, ~40 min/run on 5060 Ti, total ~12 hr.
+DEFAULT_ACTIVATIONS = ["relu2", "gelu", "trilu_asym", "swiglu", "geglu", "triglu"]
 
 
 def main():
@@ -398,7 +438,7 @@ def main():
     ap.add_argument("--seeds", type=int, default=3)
     ap.add_argument("--steps", type=int, default=None, help="override total_steps")
     ap.add_argument("--activations", type=str, default=",".join(DEFAULT_ACTIVATIONS),
-                    help="comma-separated subset of: " + ",".join(DEFAULT_ACTIVATIONS))
+                    help="comma-separated subset of: " + ",".join(ALL_ACTIVATIONS))
     ap.add_argument("--init", type=str, default="gelu_minimax",
                     choices=list(_INIT_VALUES))
     ap.add_argument("--data-dir", type=str, default="data/fineweb10B")
@@ -418,8 +458,8 @@ def main():
 
     activations = args.activations.split(",")
     for a in activations:
-        if a not in DEFAULT_ACTIVATIONS:
-            print(f"Unknown activation: {a}")
+        if a not in ALL_ACTIVATIONS:
+            print(f"Unknown activation: {a}  (known: {', '.join(ALL_ACTIVATIONS)})")
             sys.exit(1)
 
     # Cap data for tiny config to avoid loading 100M tokens for no reason.

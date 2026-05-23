@@ -15,8 +15,11 @@ import numpy as np
 COLORS = {
     "relu2": "#888888",
     "gelu": "#2c5aa0",
-    "trilu_sym": "#1a8a4a",
-    "trilu_asym": "#cc4530",
+    "trilu_sym": "#5fa84e",
+    "trilu_asym": "#1a8a4a",
+    "swiglu": "#cc4530",
+    "geglu": "#d97f3f",
+    "triglu": "#7a2d8c",
 }
 
 
@@ -42,7 +45,7 @@ def plot_val_loss(results, out_path):
 
 def plot_trilu_trajectories(results, out_path):
     """Plot how (L, R, alpha) drift over training, per layer, averaged across seeds."""
-    trilu_acts = [a for a in results if a.startswith("trilu")]
+    trilu_acts = [a for a in results if a in ("trilu_sym", "trilu_asym", "triglu")]
     if not trilu_acts:
         print("No TriLU activations in results; skipping trajectory plot.")
         return
