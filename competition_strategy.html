@@ -249,8 +249,8 @@ Or use the <code>gh</code> CLI (<code>gh auth login</code>). Prefer fine-grained
 
 <table>
 <tr><th>#</th><th>Idea</th><th>Why it ranks here</th></tr>
-<tr><td>B1</td><td><strong>Gated MLP variants (SwiGLU, GeGLU, ReGLU).</strong></td>
-  <td>Standard in Llama, Mistral, and most modern open LLMs &mdash; conspicuously absent from modded-nanogpt. Requires a fused kernel to be wallclock-competitive (because the baseline has a fused <code>Linear&rarr;ReLU&sup2;&rarr;Linear</code> kernel). 2&ndash;3 days of kernel work but likely lasting impact. Natural follow-up if TriLU shows that activation shape matters.</td></tr>
+<tr><td>B1</td><td><strong>Gated MLP variants (SwiGLU, GeGLU, TriGLU).</strong></td>
+  <td>Standard in Llama, Mistral, and most modern open LLMs &mdash; conspicuously absent from modded-nanogpt. <strong>Phase 1 now includes them</strong> in the default 6-variant sweep at no marginal cost, so the quality-comparison data is free. Phase 2 (fused gated-MLP kernel) is what becomes a Tier-B effort if Phase 1 shows gating helps. 2&ndash;3 days of kernel work but likely lasting impact.</td></tr>
 <tr><td>B2</td><td><strong>Port specific Track 1 records to Track 2 one-by-one.</strong></td>
   <td>Candidates (in approximate descending value):
     <ul style="margin: 0.3em 0;">
@@ -301,11 +301,11 @@ Or use the <code>gh</code> CLI (<code>gh auth login</code>). Prefer fine-grained
 
 <ol>
   <li><strong>Weekend 0</strong>: read <code>train_gpt.py</code> and <code>train_gpt_medium.py</code> end to end. Walk through the last 10 record PRs. Sketch a tensor-shape diagram of one forward pass. No GPU spend.</li>
-  <li><strong>Week 1</strong>: clone the Track 1 record code, get it running locally at scaled-down config, validate correctness against single-H100 rented for a few hours. Start TriLU Phase 1 on local 5060 Ti in parallel &mdash; it&rsquo;s essentially free compute.</li>
-  <li><strong>Week 2</strong>: TriLU Phase 2 (fused kernel) on single rented H100. If Phase 1 quality looks good, this is the main engineering effort. In parallel: open a Track 2 discussion thread to coordinate with maintainer; start preparing the Track 2 schedule retune (A4) and <code>coordinate_descent_tuning</code> harness (A2) so they&rsquo;re ready to bundle once TriLU is validated on Track 1.</li>
+  <li><strong>Week 1</strong>: clone the Track 1 record code, get it running locally at scaled-down config, validate correctness against single-H100 rented for a few hours. Start TriLU Phase 1 on local 5060 Ti in parallel &mdash; ~12 hr unattended for the 6-variant default sweep (ReLU&sup2;, GELU, TriLU, SwiGLU, GeGLU, TriGLU), essentially free compute.</li>
+  <li><strong>Week 2</strong>: TriLU Phase 2 (fused kernel) on single rented H100, conditional on Phase 1 results. If Phase 1 shows TriLU wins in the standard-MLP row, build the fused <code>Linear&rarr;TriLU&rarr;Linear</code> kernel. If Phase 1 shows gating dominates (SwiGLU/GeGLU/TriGLU clearly above the non-gated row), the kernel work pivots to a fused gated-MLP. In parallel: open a Track 2 discussion thread to coordinate with maintainer; start preparing the Track 2 schedule retune (A4) and <code>coordinate_descent_tuning</code> harness (A2) so they&rsquo;re ready to bundle once the winning variant is validated on Track 1.</li>
   <li><strong>Week 3</strong>: TriLU Phase 3a (Track 1 validation, p&lt;0.01). Simultaneously prepare Track 2 PR with A1 + A2 + retuned schedule (A4) bundled. Goal: submit Track 1 PR and have Track 2 PR ready within 24&ndash;48 hours of merge.</li>
   <li><strong>Week 4</strong>: TriLU Phase 3b (Track 2 validation with A1+A2+A4 bundle). Submit Track 2 PR. Maximize the chance of holding both records in the same window.</li>
-  <li><strong>Weeks 5+</strong>: A3 (port study) as the longer-arc writeup project. B-tier work conditional on results. B1 (gated MLPs) is the natural follow-up if TriLU shows activation shape matters; B2 / B3 if the port study has identified concrete missing pieces.</li>
+  <li><strong>Weeks 5+</strong>: A3 (port study) as the longer-arc writeup project. B-tier work conditional on results. B1 fused gated-MLP kernel work if Phase 1 / Phase 3 showed gating helps; B2 / B3 if the port study has identified concrete missing pieces.</li>
 </ol>
 
 <p>Total realistic budget for one record attempt (validation included): <strong>$300&ndash;800</strong> if you stay disciplined; <strong>$1500+</strong> if exploration drags. Single-H100 sweeps (Lambda/RunPod) are 5&ndash;10&times; cheaper than 8&times;H100 PrimeIntellect for the same wallclock and should be used aggressively for everything except final timing.</p>
@@ -398,20 +398,52 @@ alpha = F.softplus(theta_a)          # curvature &ge; 0
 
 <p>This is part of the Tier C4 &ldquo;co-tuning&rdquo; angle: if TriLU&rsquo;s GELU-like shape rewards a different init than ReLU&sup2;&rsquo;s unbounded shape did, that&rsquo;s where the extra leverage lives.</p>
 
-<h3>Phase 1: Quality comparison (single GPU, unfused, ~$5&ndash;20)</h3>
+<h3>Phase 1: Quality comparison (single GPU, unfused, ~12 hr on 5060 Ti)</h3>
 
-<p>Run all variants at reduced scale on a single H100 (or even 5060 Ti locally if memory permits). <strong>Same hyperparameters</strong>, same init scheme (modulo activation), same seed sweep (5 seeds).</p>
+<p>Run all variants at reduced scale on a single local GPU. <strong>Same hyperparameters</strong>, same init scheme (modulo activation), 3 seeds per variant. Default config: 6 layers, model_dim 384, seq_len 1024, batch 16, 1000 steps. Per-run: ~40 min on RTX 5060 Ti. Implemented in <code>experiments/trilu/phase1.py</code>.</p>
 
-<p>Variants:</p>
+<h4>The 6-variant default sweep (covers two questions at once)</h4>
+
+<p>The default sweep is designed as a 2&times;3 ablation over <em>{standard MLP, gated MLP} &times; {ReLU-like, GELU-like, TriLU}</em>:</p>
+
+<table>
+<tr><th></th><th>Standard MLP (2 matmuls, hidden = 4d)</th><th>Gated MLP (3 matmuls, hidden = (8/3)d)</th></tr>
+<tr><td><strong>ReLU-like</strong></td><td>ReLU&sup2; (baseline)</td><td>&mdash; (SwiGLU below replaces this slot)</td></tr>
+<tr><td><strong>GELU-like</strong></td><td>GELU (control)</td><td>GeGLU</td></tr>
+<tr><td><strong>TriLU</strong></td><td>TriLU (asymmetric)</td><td>TriGLU</td></tr>
+<tr><td><strong>SiLU-like</strong></td><td>&mdash;</td><td>SwiGLU</td></tr>
+</table>
+
+<p>So the 6 default variants are: <code>relu2, gelu, trilu_asym, swiglu, geglu, triglu</code>. This answers, in a single sweep:</p>
 
 <ol>
-  <li><strong>ReLU&sup2;</strong> (baseline)</li>
-  <li><strong>C&sup1; smooth-ReLU</strong>: 1 learnable param (<code>a</code>), symmetric TriLU with <code>&kappa;</code> pinned to <code>1/(4a)</code></li>
-  <li><strong>Symmetric TriLU</strong>: 2 learnable params per layer (<code>a, &kappa;</code>); breakpoints at <code>&plusmn;a</code>, learnable curvature.</li>
-  <li><strong>TriLU</strong> (asymmetric): 3 learnable params per layer (<code>L, R, &alpha;</code>); independent left and right breakpoints, learnable curvature. <em>Primary candidate.</em></li>
-  <li><strong>SwiGLU</strong>: standard gated MLP as a control from the &ldquo;serious modern alternative&rdquo; bucket (note: this requires structural changes to the MLP, not just an activation swap)</li>
-  <li><strong>PReLU&sup2;</strong>: <code>max(0,x)&sup2; + &alpha;&middot;min(0,x)&middot;|x|</code> with learnable <code>&alpha;</code> &mdash; cheap control variant on the negative side</li>
+  <li><strong>Does activation shape matter?</strong> (ReLU&sup2; vs GELU vs TriLU in the standard-MLP row)</li>
+  <li><strong>Does gating matter?</strong> (GELU vs GeGLU; TriLU vs TriGLU)</li>
+  <li><strong>Do they compose?</strong> (TriGLU vs SwiGLU/GeGLU)</li>
 </ol>
+
+<p>6 variants &times; 3 seeds &times; ~40 min = <strong>~12 hr total</strong> on RTX 5060 Ti.</p>
+
+<h4>Why TriGLU is in the default sweep</h4>
+
+<p><strong>SwiGLU</strong> (SiLU in a gated MLP) is the standard activation/MLP combo in modern open LLMs (Llama, Mistral, Qwen, DeepSeek). It is conspicuously absent from modded-nanogpt &mdash; ReLU&sup2; in a non-gated MLP has held since record #5 (Oct 2024). The gated form&rsquo;s formula:</p>
+
+<pre><code>GatedMLP(x) = W&#8322; &middot; ( act(W&#8321;&middot;x) &odot; (V&middot;x) )
+</code></pre>
+
+<p>The element-wise multiplication (gating) lets one channel modulate another &mdash; multiplicative interactions that pure pointwise activations can&rsquo;t express. To keep param count matched, gated variants use hidden dim <code>(8/3)d</code> instead of <code>4d</code>: three matrices of size <code>d &times; (8/3)d</code> = same <code>8d&sup2;</code> as two matrices of size <code>d &times; 4d</code>.</p>
+
+<p><strong>TriGLU</strong> &mdash; TriLU inside the gated MLP structure &mdash; composes the two hypotheses (bounded GELU-shape activation, multiplicative gating). It is genuinely interesting <em>only</em> if TriLU&rsquo;s learnable parameters contribute meaningfully beyond &ldquo;approximating GELU&rdquo;: if Phase 1&rsquo;s trajectory plots show <code>(L, R, &alpha;)</code> drifting to layer-dependent values, that&rsquo;s evidence the learnable shape matters and TriGLU is the natural Phase 3 follow-up. If trained parameters stay near the GELU-fit init, TriGLU &asymp; GeGLU &asymp; SwiGLU.</p>
+
+<h4>Optional additional variants</h4>
+
+<p>The harness also supports <code>trilu_sym</code> (symmetric TriLU, 2 params). Other variants worth running if Phase 1 results are ambiguous:</p>
+
+<ul>
+  <li><strong>C&sup1; smooth-ReLU</strong> (symmetric TriLU with <code>&kappa; = 1/(4a)</code>) &mdash; tests whether curvature beyond smoothness matters</li>
+  <li><strong>PReLU&sup2;</strong>: <code>max(0,x)&sup2; + &alpha;&middot;min(0,x)&middot;|x|</code> with learnable <code>&alpha;</code> &mdash; cheap negative-side variant</li>
+  <li><strong>ReGLU</strong>: ReLU in the gated MLP &mdash; isolates &ldquo;gating helps even with the cheap activation&rdquo;</li>
+</ul>
 
 <h4>Strategic motivation: TriLU at GELU-fit init</h4>
 
@@ -464,7 +496,7 @@ This is the cleanest possible test of the hypothesis &ldquo;ReLU&sup2; won this 
   <li>Val loss vs step count (primary)</li>
   <li>Val loss vs FLOPs (corrected for activation cost differences)</li>
   <li>Training stability (loss spikes, gradient norms)</li>
-  <li>Convergence of learned <code>(a, &kappa;)</code> trajectory over training, per layer</li>
+  <li>Convergence of learned <code>(L, R, &alpha;)</code> or <code>(a, &kappa;)</code> trajectory over training, per layer (for TriLU and TriGLU)</li>
 </ul>
 
 <p>Diagnostic interpretation:</p>
@@ -479,6 +511,8 @@ This is the cleanest possible test of the hypothesis &ldquo;ReLU&sup2; won this 
   <li>If TriLU&rsquo;s trained <code>(L, R)</code> stay symmetric (<code>L &asymp; &minus;R</code>) &rarr; symmetric TriLU was sufficient; the third parameter is redundant.</li>
   <li>If TriLU&rsquo;s trained <code>(L, R)</code> diverge (<code>L &ne; &minus;R</code>) &rarr; asymmetry matters; the third parameter pays for itself.</li>
   <li>If different layers want different <code>(L, R, &alpha;)</code> &rarr; per-layer activations are publishable irrespective of record.</li>
+  <li>If gated MLPs (SwiGLU / GeGLU / TriGLU) clearly beat their non-gated counterparts &rarr; <strong>gating dominates activation choice</strong>. Phase 2 pivots from a fused TriLU kernel to a fused gated-MLP kernel; the winning variant is the one to validate. TriGLU is the right pick over SwiGLU only if its learnable parameters drifted meaningfully during training.</li>
+  <li>If gated and non-gated tie &rarr; cheaper kernel wins. Probably TriLU in the standard MLP (no third matmul).</li>
 </ul>
 
 <h3>Phase 2: Fused kernel (single H100, ~$20&ndash;100)</h3>
@@ -584,8 +618,9 @@ This is the cleanest possible test of the hypothesis &ldquo;ReLU&sup2; won this 
 </ul>
 
 <div class="footer">
-Last updated: 2026-05-22.
+Last updated: 2026-05-22 (revision: Phase 1 expanded to 6 variants including SwiGLU/GeGLU/TriGLU; ~12 hr unattended on RTX 5060 Ti).
 Source repo: <code>aaholmes/nanogpt</code> (private mirror of <code>KellerJordan/modded-nanogpt</code>).
+Phase 1 harness: <code>experiments/trilu/phase1.py</code>.
 This document is a working strategy plan, not a commitment &mdash; revisit and revise as the project evolves.
 </div>
 

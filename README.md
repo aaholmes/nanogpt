@@ -387,6 +387,31 @@ compared to Shampoo.
 9. [Team, Gemma, et al. "Gemma 2: Improving open language models at a practical size." arXiv preprint arXiv:2408.00118 (2024).](https://arxiv.org/abs/2408.00118)
 10. [Alec Radford et al. "Language models are unsupervised multitask learners." OpenAI blog 1.8 (2019).](https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf)
 
+---
+
+## Fork: TriLU / TriGLU activation experiment
+
+This fork is exploring a learnable piecewise-polynomial activation function family — **TriLU** (Three-piece Linear Unit) — as an alternative to ReLU². The activation has the form `f(x) = 0` for `x ≤ L`, a learnable quadratic for `L < x < R`, and `f(x) = x` for `x ≥ R`, with 2–3 per-layer learnable parameters. At the minimax GELU-fit init `(L, R, α) = (−1.91, 1.91, 0.247)` it tracks GELU within max abs error 0.053 / RMS 0.029, at roughly 2.5× ReLU²'s per-element op count (negligible inside a fused MLP kernel).
+
+**Core hypothesis:** ReLU² won this codebase on cost, not shape. A bounded GELU-shape activation at near-ReLU² cost should beat ReLU² on wallclock to the target loss.
+
+**Gated variants:** `SwiGLU`, `GeGLU`, and the novel `TriGLU` (TriLU inside a gated MLP) are included in the Phase 1 comparison to disentangle the activation-shape question from the gating question.
+
+### Plan
+
+- **Phase 1** (essentially free, local single-GPU): quality comparison of ReLU² / GELU / TriLU / SwiGLU / GeGLU / TriGLU at matched compute. 6 variants × 3 seeds × ~40 min ≈ 12 hr on RTX 5060 Ti.
+- **Phase 2** (~$50–100, single H100): fused `Linear → TriLU → Linear` Triton kernel; wallclock comparison vs the existing fused ReLU² kernel (record #59).
+- **Phase 3a** (Track 1 validation, ~$20–60): 8–15 trials at full Track 1 config.
+- **Phase 3b** (Track 2 validation, ~$60–160): port + `coordinate_descent_tuning` + schedule retune, submitted in close succession with the Track 1 PR.
+
+Detailed strategy, rules analysis, conditional probabilities, and risks: [`competition_strategy.html`](competition_strategy.html).
+
+Phase 1 harness: [`experiments/trilu/phase1.py`](experiments/trilu/phase1.py), plotter [`experiments/trilu/plot.py`](experiments/trilu/plot.py).
+
+GELU-fit derivation (L² vs minimax): [`img/gelu_vs_variant4.png`](img/gelu_vs_variant4.png), [`img/gelu_fit_L2_vs_Linf.png`](img/gelu_fit_L2_vs_Linf.png).
+
+---
+
 ## Citation
 
 ```
