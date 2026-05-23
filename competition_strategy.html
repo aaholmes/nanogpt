@@ -410,11 +410,11 @@ alpha = F.softplus(theta_a)          # curvature &ge; 0
 <tr><th></th><th>Standard MLP (2 matmuls, hidden = 4d)</th><th>Gated MLP (3 matmuls, hidden = (8/3)d)</th></tr>
 <tr><td><strong>ReLU-like</strong></td><td>ReLU&sup2; (baseline)</td><td>&mdash; (SwiGLU below replaces this slot)</td></tr>
 <tr><td><strong>GELU-like</strong></td><td>GELU (control)</td><td>GeGLU</td></tr>
-<tr><td><strong>TriLU</strong></td><td>TriLU (asymmetric)</td><td>TriGLU</td></tr>
+<tr><td><strong>TriLU</strong></td><td>TriLU (frozen at GELU-fit, primary)</td><td>TriGLU (frozen at GELU-fit, primary)</td></tr>
 <tr><td><strong>SiLU-like</strong></td><td>&mdash;</td><td>SwiGLU</td></tr>
 </table>
 
-<p>So the 6 default variants are: <code>relu2, gelu, trilu_asym, swiglu, geglu, triglu</code>. This answers, in a single sweep:</p>
+<p>So the 6 default variants are: <code>relu2, gelu, trilu_asym, swiglu, geglu, triglu</code>. <strong>The recommended setup runs TriLU and TriGLU with parameters frozen at the minimax GELU-fit values</strong> (see &ldquo;Frozen vs learnable TriLU&rdquo; below). In the harness this is achieved by setting <code>requires_grad=False</code> on the <code>theta_*</code> parameters of the TriLU modules; the default learnable variant is a useful secondary test but not the primary hypothesis test. This answers, in a single sweep:</p>
 
 <ol>
   <li><strong>Does activation shape matter?</strong> (ReLU&sup2; vs GELU vs TriLU in the standard-MLP row)</li>
@@ -435,15 +435,68 @@ alpha = F.softplus(theta_a)          # curvature &ge; 0
 
 <p><strong>TriGLU</strong> &mdash; TriLU inside the gated MLP structure &mdash; composes the two hypotheses (bounded GELU-shape activation, multiplicative gating). It is genuinely interesting <em>only</em> if TriLU&rsquo;s learnable parameters contribute meaningfully beyond &ldquo;approximating GELU&rdquo;: if Phase 1&rsquo;s trajectory plots show <code>(L, R, &alpha;)</code> drifting to layer-dependent values, that&rsquo;s evidence the learnable shape matters and TriGLU is the natural Phase 3 follow-up. If trained parameters stay near the GELU-fit init, TriGLU &asymp; GeGLU &asymp; SwiGLU.</p>
 
+<h4>Frozen vs learnable TriLU: the cleanest hypothesis test</h4>
+
+<div class="good">
+<p><strong>The cleanest variant is <em>frozen</em> TriLU at the minimax GELU-fit values</strong> &mdash; <code>(L, R, &alpha;)</code> initialized at <code>(&minus;1.910, +1.910, 0.247)</code> and <em>never updated</em>. Zero learnable activation parameters.</p>
+<p>Why: every existing activation in modded-nanogpt is fixed (ReLU&sup2;, GELU, SiLU all have no params). A like-for-like test of &ldquo;GELU-shape vs ReLU&sup2;-shape at near-equal cost&rdquo; should also have no learnable params, otherwise any win is confounded between &ldquo;the shape itself&rdquo; and &ldquo;the network found a better shape via the learnable knobs.&rdquo;</p>
+</div>
+
+<p>The full TriLU progression for Phase 1, in order of increasing flexibility:</p>
+
+<table>
+<tr><th>Variant</th><th>Learnable params</th><th>What it tests</th></tr>
+<tr><td><strong>Frozen TriLU</strong> at minimax (recommended primary)</td><td>0</td><td>Pure shape comparison: does GELU's shape beat ReLU&sup2;'s shape at near-equal cost?</td></tr>
+<tr><td>Learnable symmetric TriLU</td><td>2 per layer (<code>a, &kappa;</code>)</td><td>Does the network want to drift slightly from GELU?</td></tr>
+<tr><td>Learnable asymmetric TriLU</td><td>3 per layer (<code>L, R, &alpha;</code>)</td><td>Does the network want asymmetric breakpoints?</td></tr>
+</table>
+
+<p><strong>Practical order:</strong> run frozen first. If it beats ReLU&sup2;, hypothesis confirmed cleanly &mdash; proceed to Phase 2 with the frozen variant as the actual candidate. The learnable variants then become follow-up <em>refinements</em>, not primary tests. (If trained <code>(L, R, &alpha;)</code> drift to layer-dependent values, that&rsquo;s an interesting secondary finding; if they stay near init, the simpler frozen variant was the right choice anyway.)</p>
+
 <h4>Optional additional variants</h4>
 
-<p>The harness also supports <code>trilu_sym</code> (symmetric TriLU, 2 params). Other variants worth running if Phase 1 results are ambiguous:</p>
+<p>Useful if Phase 1 results are ambiguous:</p>
 
 <ul>
   <li><strong>C&sup1; smooth-ReLU</strong> (symmetric TriLU with <code>&kappa; = 1/(4a)</code>) &mdash; tests whether curvature beyond smoothness matters</li>
   <li><strong>PReLU&sup2;</strong>: <code>max(0,x)&sup2; + &alpha;&middot;min(0,x)&middot;|x|</code> with learnable <code>&alpha;</code> &mdash; cheap negative-side variant</li>
   <li><strong>ReGLU</strong>: ReLU in the gated MLP &mdash; isolates &ldquo;gating helps even with the cheap activation&rdquo;</li>
 </ul>
+
+<h4>4-piece extension (considered, deferred)</h4>
+
+<p>A natural generalization: a 4-piece function with an explicit linear underbite segment between the zero and quadratic regions:</p>
+
+<pre><code>             ┌  0                       if x &le; a
+4piece(x) =  │  m(x − a)                 if a &lt; x &lt; b   (linear, slope m, anchored at (a, 0))
+             │  &alpha;x&sup2; + &beta;x + &gamma;          if b &lt; x &lt; c   (quadratic, C&deg; to neighbors)
+             └  x                        if x &ge; c
+</code></pre>
+
+<p>5 learnable parameters: <code>a, b, c, m, &alpha;</code>. With <code>m &lt; 0</code> this models GELU's negative-side underbite explicitly.</p>
+
+<p>Minimax GELU fit (with <code>a &isin; [&minus;20, &minus;0.1]</code>; converges to <code>a &asymp; &minus;3.74</code>, well off the boundary):</p>
+
+<table>
+<tr><th>Function</th><th>Params</th><th>Max abs error to GELU</th><th>RMS error</th></tr>
+<tr><td>TriLU (asymmetric)</td><td>3</td><td>0.0534</td><td>0.0289</td></tr>
+<tr><td>4-piece</td><td>5</td><td>0.0401</td><td>0.0247</td></tr>
+<tr><td><em>Improvement</em></td><td><em>+2 params</em></td><td><em>−25%</em></td><td><em>−14%</em></td></tr>
+</table>
+
+<p>4-piece best-fit params: <code>a = &minus;3.74, b = &minus;0.29, c = +2.06, m = &minus;0.044, &alpha; = 0.171</code>. Equi-oscillation residuals at 6 alternating extrema of magnitude &asymp;0.040, confirming minimax-optimality.</p>
+
+<p><img src="img/gelu_trilu_vs_4piece.png" alt="TriLU vs 4-piece minimax fits to GELU" style="max-width: 100%; border: 1px solid var(--border); border-radius: 5px;"></p>
+
+<p><strong>Why we&rsquo;re deferring this:</strong></p>
+<ul>
+  <li><strong>Same hypothesis, marginally better fit.</strong> The 4-piece doesn&rsquo;t test a meaningfully different hypothesis than TriLU &mdash; it&rsquo;s the same &ldquo;GELU-shape vs ReLU&sup2;&rdquo; question with a 25% closer approximation. If TriLU at GELU-fit init beats ReLU&sup2;, the differential improvement from 4-piece will likely be lost in noise. If TriLU loses, 4-piece probably loses too.</li>
+  <li><strong>Diminishing returns.</strong> ReLU&sup2; (0 params) &rarr; TriLU (3 params) &rarr; 4-piece (5 params) &rarr; ... at some point you&rsquo;re building a spline approximation to GELU and should just use GELU. The 4-piece is the last useful step before that.</li>
+  <li><strong>Kernel complexity scales.</strong> 4 regions vs 3 means one extra compare per element and 5 scalar inputs to the fused kernel instead of 3. Not catastrophic, but adds friction for a marginal gain.</li>
+  <li><strong>The underbite TriLU already provides may be enough.</strong> TriLU at <code>&kappa; = 0.247 &gt; 1/(4&times;1.91) = 0.131</code> is in the underbite regime &mdash; the quadratic dips below zero (min &asymp; &minus;0.20 at <code>x &asymp; &minus;1.01</code>). It's not a great underbite fit (GELU's true min is <code>&minus;0.170</code> at <code>x &asymp; &minus;0.752</code>), but it's nonzero, and the 4-piece's explicit linear segment doesn't dramatically improve underbite-region fidelity either.</li>
+</ul>
+
+<p><strong>When to revisit:</strong> if Phase 1 TriLU trajectory plots show the network wanting a deeper or differently-positioned underbite than TriLU can produce, the 4-piece becomes a natural follow-up. Until that signal exists, the added complexity isn&rsquo;t justified.</p>
 
 <h4>Strategic motivation: TriLU at GELU-fit init</h4>
 
@@ -618,7 +671,7 @@ This is the cleanest possible test of the hypothesis &ldquo;ReLU&sup2; won this 
 </ul>
 
 <div class="footer">
-Last updated: 2026-05-22 (revision: Phase 1 expanded to 6 variants including SwiGLU/GeGLU/TriGLU; ~12 hr unattended on RTX 5060 Ti).
+Last updated: 2026-05-22 (revision: clarified frozen TriLU as cleanest hypothesis test; 4-piece extension considered and deferred with reasoning).
 Source repo: <code>aaholmes/nanogpt</code> (private mirror of <code>KellerJordan/modded-nanogpt</code>).
 Phase 1 harness: <code>experiments/trilu/phase1.py</code>.
 This document is a working strategy plan, not a commitment &mdash; revisit and revise as the project evolves.

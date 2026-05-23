@@ -351,21 +351,24 @@ def train_one(config, train_data, val_data, seed, device):
     print(f"  params: {n_params:,}")
 
     # Separate param groups: main weights at full LR, TriLU activation params at 0.1x.
+    # If --freeze-trilu, the activation params are frozen at their init values.
+    freeze_trilu = config.get("freeze_trilu", False)
     main_params, act_params = [], []
     for name, p in model.named_parameters():
         if "theta_" in name:
-            act_params.append(p)
+            if freeze_trilu:
+                p.requires_grad_(False)
+            else:
+                act_params.append(p)
         else:
             main_params.append(p)
 
-    optimizer = torch.optim.AdamW(
-        [
-            {"params": main_params, "lr": config["lr"]},
-            {"params": act_params, "lr": config["lr"] * 0.1},
-        ],
-        betas=(0.9, 0.95),
-        weight_decay=0.1,
-    )
+    param_groups = [{"params": main_params, "lr": config["lr"]}]
+    if act_params:
+        param_groups.append({"params": act_params, "lr": config["lr"] * 0.1})
+    optimizer = torch.optim.AdamW(param_groups, betas=(0.9, 0.95), weight_decay=0.1)
+    if freeze_trilu and config["activation"] in ("trilu_sym", "trilu_asym", "triglu"):
+        print(f"  TriLU activation params FROZEN at init (0 learnable activation params)")
 
     has_trilu = config["activation"] in ("trilu_sym", "trilu_asym", "triglu")
     log = {"val_loss": [], "trilu_params": [], "wallclock": [], "config": config, "seed": seed}
@@ -454,6 +457,9 @@ def main():
     ap.add_argument("--device", type=str, default=None,
                     choices=[None, "cpu", "mps", "cuda"],
                     help="override device auto-detection (try --device cpu if MPS crashes)")
+    ap.add_argument("--freeze-trilu", action="store_true",
+                    help="freeze TriLU/TriGLU activation params at their init values (cleanest "
+                         "hypothesis test — like-for-like with fixed ReLU²/GELU/etc.)")
     args = ap.parse_args()
 
     if args.tiny:
@@ -480,7 +486,7 @@ def main():
 
     all_results = {}
     for act in activations:
-        cfg = dict(cfg_base, activation=act, init=args.init)
+        cfg = dict(cfg_base, activation=act, init=args.init, freeze_trilu=args.freeze_trilu)
         all_results[act] = []
         for seed in range(args.seeds):
             print(f"\n=== activation={act}  seed={seed} ===")
