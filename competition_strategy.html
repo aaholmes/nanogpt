@@ -526,6 +526,30 @@ This is the cleanest possible test of the hypothesis &ldquo;ReLU&sup2; won this 
 
 <p>So <strong>for the GELU-init starting point, asymmetric TriLU and symmetric TriLU are equivalent</strong>. The asymmetric form&rsquo;s extra degree of freedom matters only if the network drifts to asymmetric breakpoints during training. Run both as separate experiments &mdash; if TriLU&rsquo;s trained <code>(L, R)</code> stay symmetric, symmetric TriLU was sufficient; if not, the third parameter pays for itself.</p>
 
+<h4>Why GELU specifically, not SiLU/Swish</h4>
+
+<p>SwiGLU (SiLU in a gated MLP) is the modern LLM standard, so a reasonable question is whether TriLU should target SiLU instead of GELU. The numerical answer settles this: <strong>TriLU is structurally a GELU approximator, not a SiLU approximator</strong>.</p>
+
+<table>
+<tr><th>Target</th><th>Best TriLU params (minimax)</th><th>Max abs error</th><th>RMS error</th></tr>
+<tr><td>GELU</td><td>L=&minus;1.91, R=1.91, &alpha;=0.247</td><td><strong>0.054</strong></td><td><strong>0.026</strong></td></tr>
+<tr><td>SiLU / Swish</td><td>L=&minus;3.42, R=3.42, &alpha;=0.137</td><td>0.109</td><td>0.074</td></tr>
+</table>
+
+<p>TriLU fits SiLU about <strong>2&times; worse on max error, 3&times; worse on RMS</strong>. Structural reason: SiLU has a deeper, wider underbite (min &asymp;&minus;0.28 at <code>x=&minus;1.28</code>) vs GELU's milder underbite (min &asymp;&minus;0.17 at <code>x=&minus;0.75</code>). TriLU's quadratic middle has to stretch its breakpoints out to <code>&plusmn;3.42</code> to span the SiLU underbite region, and the resulting fit can't track SiLU through that underbite without large residuals.</p>
+
+<p><img src="img/trilu_fit_gelu_vs_silu.png" alt="TriLU minimax fits to GELU vs SiLU" style="max-width: 100%; border: 1px solid var(--border); border-radius: 5px;"></p>
+
+<p><strong>Implication for the experiment design:</strong></p>
+<ul>
+  <li><strong>TriLU competes with GELU.</strong> Frozen TriLU at GELU-fit is genuinely a GELU stand-in. The Phase 1 standard-MLP row tests ReLU&sup2; vs GELU vs TriLU as three nearly-equivalent-shape candidates.</li>
+  <li><strong>TriGLU competes with GeGLU.</strong> Same activation shape (GELU-like), same gating structure. This is the cleanest gated-MLP comparison.</li>
+  <li><strong>Neither competes with SiLU/SwiGLU directly.</strong> SwiGLU is included as a modern LLM reference point in the gated row but tests a different shape entirely. A win for SwiGLU over GeGLU/TriGLU would suggest SiLU's shape matters; a win for TriGLU/GeGLU over SwiGLU would suggest the SiLU vs GELU difference doesn't matter (and the lower-cost activation wins).</li>
+  <li><strong>If SiLU's shape turns out to matter</strong> (SwiGLU clearly above GeGLU and TriGLU in Phase 1), the 4-piece extension is a better path to a SiLU stand-in than TriLU &mdash; its explicit linear underbite segment can accommodate SiLU's wider negative tail. Reserved as a Phase 1.5 follow-up.</li>
+</ul>
+
+<p>The historical context also favors GELU: it's the activation that ReLU&sup2; <em>actually replaced</em> in this codebase (record #5, Oct 2024). The cleanest hypothesis test is the direct historical question.</p>
+
 <h4>Initialization options</h4>
 
 <ul>
@@ -671,7 +695,7 @@ This is the cleanest possible test of the hypothesis &ldquo;ReLU&sup2; won this 
 </ul>
 
 <div class="footer">
-Last updated: 2026-05-22 (revision: clarified frozen TriLU as cleanest hypothesis test; 4-piece extension considered and deferred with reasoning).
+Last updated: 2026-05-23 (revision: clarified GELU as the appropriate fit target — TriLU structurally approximates GELU much better than SiLU; SwiGLU positioned as a "different shape" reference rather than a TriGLU competitor).
 Source repo: <code>aaholmes/nanogpt</code> (private mirror of <code>KellerJordan/modded-nanogpt</code>).
 Phase 1 harness: <code>experiments/trilu/phase1.py</code>.
 This document is a working strategy plan, not a commitment &mdash; revisit and revise as the project evolves.
