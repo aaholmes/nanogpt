@@ -83,6 +83,38 @@ def plot_trilu_trajectories(results, out_path):
     print(f"Saved {out_path}")
 
 
+def plot_dead_zones(results, out_path):
+    """Plot mean dead-zone fraction (averaged across MLP layers and seeds) vs step."""
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    for act, runs in results.items():
+        if not runs or not runs[0].get("dead_zones"):
+            continue
+        steps = np.array([s for s, _ in runs[0]["dead_zones"]])
+        # mean dead fraction across layers, then across seeds
+        per_seed_mean = []
+        for r in runs:
+            seed_means = []
+            for _, layer_pairs in r["dead_zones"]:
+                fracs = [f for _, f in layer_pairs]
+                seed_means.append(np.mean(fracs))
+            per_seed_mean.append(seed_means)
+        per_seed_mean = np.array(per_seed_mean)
+        mean = per_seed_mean.mean(axis=0)
+        std = per_seed_mean.std(axis=0)
+        color = COLORS.get(act, "#444444")
+        ax.plot(steps, mean, label=act, color=color, linewidth=2)
+        ax.fill_between(steps, mean - std, mean + std, alpha=0.18, color=color)
+    ax.set_xlabel("step")
+    ax.set_ylabel("mean dead fraction (|activation output| < 1e-4)")
+    ax.set_title("Dead-zone fraction over training (mean across MLP layers, ± std across seeds)")
+    ax.set_ylim(bottom=0)
+    ax.legend()
+    ax.grid(True, alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=140, bbox_inches="tight")
+    print(f"Saved {out_path}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--results", default="experiments/trilu/results.json")
@@ -97,6 +129,7 @@ def main():
 
     plot_val_loss(results, out_dir / "val_loss.png")
     plot_trilu_trajectories(results, out_dir / "trilu_trajectories.png")
+    plot_dead_zones(results, out_dir / "dead_zones.png")
 
 
 if __name__ == "__main__":

@@ -165,6 +165,9 @@ class CausalSelfAttention(nn.Module):
         return self.out(out)
 
 
+_DEAD_THRESHOLD = 1e-4  # |output| < this counts as "dead" for diagnostic purposes
+
+
 class MLP(nn.Module):
     """Standard transformer MLP: W2 . act(W1 . x). Used by relu2, gelu, trilu_*."""
 
@@ -173,9 +176,15 @@ class MLP(nn.Module):
         self.fc1 = nn.Linear(dim, mlp_dim, bias=False)
         self.fc2 = nn.Linear(mlp_dim, dim, bias=False)
         self.act = activation
+        self._capture_dead = False
+        self._last_dead_frac: float | None = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc2(self.act(self.fc1(x)))
+        h = self.act(self.fc1(x))
+        if self._capture_dead:
+            with torch.no_grad():
+                self._last_dead_frac = (h.abs() < _DEAD_THRESHOLD).float().mean().item()
+        return self.fc2(h)
 
 
 class GatedMLP(nn.Module):
@@ -187,9 +196,15 @@ class GatedMLP(nn.Module):
         self.fc_gate = nn.Linear(dim, mlp_dim, bias=False)
         self.fc2 = nn.Linear(mlp_dim, dim, bias=False)
         self.act = activation
+        self._capture_dead = False
+        self._last_dead_frac: float | None = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc2(self.act(self.fc1(x)) * self.fc_gate(x))
+        h = self.act(self.fc1(x)) * self.fc_gate(x)
+        if self._capture_dead:
+            with torch.no_grad():
+                self._last_dead_frac = (h.abs() < _DEAD_THRESHOLD).float().mean().item()
+        return self.fc2(h)
 
 
 def make_mlp(dim: int, model_dim: int, act_name: str, act_init: str) -> nn.Module:
@@ -332,6 +347,29 @@ def evaluate(model, val_data, batch_size, seq_len, device, gen, num_batches=20):
     return sum(losses) / len(losses)
 
 
+@torch.no_grad()
+def measure_dead_zones(model, val_data, batch_size, seq_len, device, gen):
+    """Run a single eval batch with dead-zone capture enabled; return per-layer fractions.
+
+    A neuron is 'dead' for this measurement if its activation output magnitude is < 1e-4.
+    For ReLU²/TriLU this corresponds to pre-activation in the zero region.
+    For GELU/SiLU this is approximately never (smooth tails are nonzero).
+    """
+    mlp_modules = []
+    for name, m in model.named_modules():
+        if isinstance(m, (MLP, GatedMLP)):
+            mlp_modules.append((name, m))
+            m._capture_dead = True
+    model.eval()
+    batch = sample_batch(val_data, batch_size, seq_len, device, gen)
+    x, y = batch[:, :-1], batch[:, 1:]
+    model(x, y)
+    model.train()
+    for _, m in mlp_modules:
+        m._capture_dead = False
+    return [(name, m._last_dead_frac) for name, m in mlp_modules]
+
+
 def train_one(config, train_data, val_data, seed, device):
     torch.manual_seed(seed)
     gen_train = torch.Generator().manual_seed(seed)
@@ -371,7 +409,7 @@ def train_one(config, train_data, val_data, seed, device):
         print(f"  TriLU activation params FROZEN at init (0 learnable activation params)")
 
     has_trilu = config["activation"] in ("trilu_sym", "trilu_asym", "triglu")
-    log = {"val_loss": [], "trilu_params": [], "wallclock": [], "config": config, "seed": seed}
+    log = {"val_loss": [], "trilu_params": [], "dead_zones": [], "wallclock": [], "config": config, "seed": seed}
 
     t0 = time.time()
     for step in range(config["total_steps"]):
@@ -390,12 +428,16 @@ def train_one(config, train_data, val_data, seed, device):
 
         if step % config["eval_every"] == 0 or step == config["total_steps"] - 1:
             val_loss = evaluate(model, val_data, config["batch_size"], config["seq_len"], device, gen_val)
+            dead = measure_dead_zones(model, val_data, config["batch_size"], config["seq_len"], device, gen_val)
+            mean_dead = sum(f for _, f in dead) / max(len(dead), 1)
             elapsed = time.time() - t0
             log["val_loss"].append([step, val_loss])
             log["wallclock"].append([step, elapsed])
+            log["dead_zones"].append([step, dead])
             if has_trilu:
                 log["trilu_params"].append([step, collect_trilu_params(model)])
-            print(f"  step {step:5d}  lr={cur_lr:.5f}  train={loss.item():.4f}  val={val_loss:.4f}  t={elapsed:.1f}s")
+            print(f"  step {step:5d}  lr={cur_lr:.5f}  train={loss.item():.4f}  val={val_loss:.4f}  "
+                  f"dead={mean_dead:.3f}  t={elapsed:.1f}s")
 
     return log
 
