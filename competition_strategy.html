@@ -506,13 +506,23 @@ alpha = F.softplus(theta_a)          # curvature &ge; 0
 <div class="good">
 <strong>The strategic case:</strong>
 <ul>
-  <li>ReLU&sup2; was selected in this codebase (record #5) primarily because it&rsquo;s <em>cheaper</em> than GELU, not because it was demonstrably better-shaped. GELU was the prior standard.</li>
-  <li>Modern LLMs (Llama, Mistral, GPT-4 family) overwhelmingly use GELU or SwiGLU. ReLU&sup2; is a niche choice driven by the wallclock objective of this benchmark.</li>
-  <li>TriLU at the minimax-fit init <code>(L = &minus;1.91, R = +1.91, &alpha; = 0.247)</code> tracks GELU within <strong>max error 0.053 / RMS 0.029</strong> &mdash; essentially indistinguishable from GELU in any reasonable activation distribution.</li>
+  <li>ReLU&sup2; was selected in this codebase (record #5) as a slight quality win over GELU, not a dramatic shape change. The inline comment in record #5&rsquo;s code reads: <em>&ldquo;~1-2% better than GELU&rdquo;</em> (citing the Primer paper, arxiv 2109.08668).</li>
+  <li>Modern LLMs (Llama, Mistral, GPT-4 family) overwhelmingly use GELU or SwiGLU. ReLU&sup2; is a niche choice for this wallclock benchmark.</li>
+  <li>TriLU at the minimax-fit init <code>(L = &minus;1.91, R = +1.91, &alpha; = 0.247)</code> tracks GELU within <strong>max error 0.053 / RMS 0.029</strong>.</li>
   <li>Cost: ~5 ops/element vs ReLU&sup2;&rsquo;s ~2. Inside the fused MLP kernel, activation cost is a small fraction (~2&ndash;5%) of matmul cost. The wallclock overhead is ~1&ndash;3% per MLP block.</li>
-  <li>If GELU&rsquo;s shape gives <em>any</em> quality improvement over ReLU&sup2; (fewer steps to target), the net wallclock should be positive.</li>
 </ul>
-This is the cleanest possible test of the hypothesis &ldquo;ReLU&sup2; won this codebase on cost, not shape.&rdquo;
+This is the cleanest possible test of the hypothesis "GELU shape vs ReLU&sup2; shape at near-equal cost." The expected magnitude is modest (see below).
+</div>
+
+<div class="warn">
+<strong>Calibrated expectation (sobering reality check).</strong> If record #5&rsquo;s inline comment is right that ReLU&sup2; is "~1-2% better than GELU," then TriLU at GELU-fit (which approximates GELU within ~0.05) recovers <em>at most</em> ~1-2% relative to ReLU&sup2;. Net expected wallclock improvement after accounting for the fused-kernel cost: <strong>0&ndash;2%</strong>.
+<p>For context: <strong>recent Track 1 records improve by 50&ndash;200 ms out of ~85 seconds, i.e. 0.1&ndash;0.25% per record</strong>. So a 1&ndash;2% net win would be a <em>large</em> record by current standards. But the margin is tight enough that:</p>
+<ul>
+  <li>Seed noise can mask it &mdash; need many seeds for p&lt;0.01 significance</li>
+  <li>Co-tuning matters disproportionately (Phase 1.5) &mdash; a 1&ndash;2% effect is the same magnitude as casual hyperparameter mis-tuning</li>
+  <li>The loss-buffer rule constrains how the win must be claimed (fewer steps at same loss, not lower loss at same steps)</li>
+</ul>
+<strong>Implication:</strong> don&rsquo;t bank on a flashy record. The realistic best case is "1-2% record after careful co-tuning"; the realistic median case is "tie or marginal" with the writeup being the deliverable.
 </div>
 
 <p>Visual comparison vs ReLU&sup2;:</p>
@@ -664,10 +674,10 @@ This is the cleanest possible test of the hypothesis &ldquo;ReLU&sup2; won this 
 
 <table>
 <tr><th>Event</th><th>Estimated probability</th></tr>
-<tr><td>TriLU clears a Track 1 record on its own</td><td>20&ndash;40%</td></tr>
+<tr><td>TriLU clears a Track 1 record (with Phase 1.5 co-tuning)</td><td>15&ndash;30% <em>(revised down from earlier 20&ndash;40% in light of record #5&rsquo;s "1-2% better than GELU" inline note &mdash; expected magnitude smaller than initially framed)</em></td></tr>
 <tr><td>Track 2 record conditional on Track 1 working (TriLU + A2 + A4)</td><td>70&ndash;90%</td></tr>
 <tr><td>Track 1 record holds long enough for you to ship Track 2 (1&ndash;2 weeks)</td><td>60&ndash;80%</td></tr>
-<tr><td><strong>Hold both records simultaneously</strong></td><td><strong>~10&ndash;30%</strong></td></tr>
+<tr><td><strong>Hold both records simultaneously</strong></td><td><strong>~7&ndash;20%</strong></td></tr>
 </table>
 
 <h4>Three risks to manage</h4>
@@ -735,7 +745,7 @@ This is the cleanest possible test of the hypothesis &ldquo;ReLU&sup2; won this 
 </ul>
 
 <div class="footer">
-Last updated: 2026-05-26 (revision: added Phase 1.5 co-tuning step to address hyperparameter coupling; ReLU&sup2;-tuned settings (init std, softcap, LR) likely disadvantage TriLU in a drop-in comparison; same caveat added to A3 port study).
+Last updated: 2026-05-27 (revision: calibrated expectations based on record #5&rsquo;s inline note "~1-2% better than GELU" &mdash; TriLU&rsquo;s expected magnitude is modest, ~0-2% wallclock at best; conditional probabilities revised down).
 Source repo: <code>aaholmes/nanogpt</code> (private mirror of <code>KellerJordan/modded-nanogpt</code>).
 Phase 1 harness: <code>experiments/trilu/phase1.py</code>.
 This document is a working strategy plan, not a commitment &mdash; revisit and revise as the project evolves.
