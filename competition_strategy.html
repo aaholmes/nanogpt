@@ -240,7 +240,7 @@ Or use the <code>gh</code> CLI (<code>gh auth login</code>). Prefer fine-grained
 <tr><td>A2</td><td><strong>Enable <code>coordinate_descent_tuning</code> on Track 2.</strong></td>
   <td>Explicitly allowed in the rules but never tried. The bulk-transfer author flagged it: &ldquo;Presumably this is helpful. I didn&rsquo;t notice this flag until I did the two runs.&rdquo; Near-zero engineering work; might itself clear a record. Bundles naturally with A1&rsquo;s Track 2 phase but also viable standalone if A1 doesn&rsquo;t pan out on Track 1.</td></tr>
 <tr><td>A3</td><td><strong>Systematic Track 1 &rarr; Track 2 port study.</strong></td>
-  <td>The bulk-transfer author wrote: &ldquo;I have no scaling intuition yet.&rdquo; The empirical question &ldquo;which speedrun tricks transfer from 125M to 350M, and which don&rsquo;t&rdquo; is unanswered and publishable <em>with or without</em> a record. Strong learning value and the most natural portfolio centerpiece. Combine: port unported features, retune schedules, ablate.</td></tr>
+  <td>The bulk-transfer author wrote: &ldquo;I have no scaling intuition yet.&rdquo; The empirical question &ldquo;which speedrun tricks transfer from 125M to 350M, and which don&rsquo;t&rdquo; is unanswered and publishable <em>with or without</em> a record. Strong learning value and the most natural portfolio centerpiece. Combine: port unported features, retune schedules, ablate. <br><br><strong>Same co-tuning caveat as A1:</strong> a Track 1 feature dropped into Track 2 with no retuning is testing the feature at Track-1-tuned settings, not at its Track-2-optimal settings. The bulk-transfer author acknowledged this: &ldquo;schedules can be improved.&rdquo; Each ported feature should be evaluated both at the existing schedule AND with a brief co-tune of the most-coupled parameters (LR, init scale, schedule timing). Negative results from drop-in comparisons aren&rsquo;t conclusive without this.</td></tr>
 <tr><td>A4</td><td><strong>Schedule retune at Medium scale.</strong></td>
   <td>The bulk-transfer used &ldquo;first guesses&rdquo; for LR, WD, cooldown frac, batch-size ramp. Sweeps at small N can be done cheaply (1 H100). Likely to compose with A2 and A3.</td></tr>
 </table>
@@ -277,8 +277,8 @@ Or use the <code>gh</code> CLI (<code>gh auth login</code>). Prefer fine-grained
   <td>The bulk-transfer used a guess. FA3 needs to compile each window size, so the schedule needs to balance compile overhead against the curve. Phase-1 testable.</td></tr>
 <tr><td>C3</td><td><strong>Medium-specific logit-scaling formula.</strong></td>
   <td>Was tuned for Medium pre-bulk; current code uses Small&rsquo;s. Cheap to study, modest payoff.</td></tr>
-<tr><td>C4</td><td><strong>Activation/init/softcap co-tuning.</strong></td>
-  <td>The interesting frontier in activations isn&rsquo;t the activation alone &mdash; it&rsquo;s coordinated retuning of init scales, softcap value, FP8 quant scales <em>around</em> the activation. Most prior activation tweaks didn&rsquo;t do this; if you do, you may unlock a small but real bounded-activation regime that doesn&rsquo;t exist in the current code.</td></tr>
+<tr><td>C4</td><td><strong>Activation/init/softcap co-tuning.</strong> <em>Promoted to Phase 1.5 of A1 &mdash; see Section 7.</em></td>
+  <td>The interesting frontier in activations isn&rsquo;t the activation alone &mdash; it&rsquo;s coordinated retuning of init scales, softcap value, FP8 quant scales <em>around</em> the activation. This is no longer "speculative tier C" but a necessary step in any honest TriLU comparison. The current modded-nanogpt hyperparameters (especially init std and softcap) are tuned around ReLU&sup2;&rsquo;s &sigma;&#8308; variance scaling; TriLU&rsquo;s bounded slope likely tolerates different settings.</td></tr>
 </table>
 
 <h3>Tier D: Long shots; only attempt if specifically motivated</h3>
@@ -302,9 +302,10 @@ Or use the <code>gh</code> CLI (<code>gh auth login</code>). Prefer fine-grained
 <ol>
   <li><strong>Weekend 0</strong>: read <code>train_gpt.py</code> and <code>train_gpt_medium.py</code> end to end. Walk through the last 10 record PRs. Sketch a tensor-shape diagram of one forward pass. No GPU spend.</li>
   <li><strong>Week 1</strong>: clone the Track 1 record code, get it running locally at scaled-down config, validate correctness against single-H100 rented for a few hours. Start TriLU Phase 1 on local 5060 Ti in parallel &mdash; ~12 hr unattended for the 6-variant default sweep (ReLU&sup2;, GELU, TriLU, SwiGLU, GeGLU, TriGLU), essentially free compute.</li>
-  <li><strong>Week 2</strong>: TriLU Phase 2 (fused kernel) on single rented H100, conditional on Phase 1 results. If Phase 1 shows TriLU wins in the standard-MLP row, build the fused <code>Linear&rarr;TriLU&rarr;Linear</code> kernel. If Phase 1 shows gating dominates (SwiGLU/GeGLU/TriGLU clearly above the non-gated row), the kernel work pivots to a fused gated-MLP. In parallel: open a Track 2 discussion thread to coordinate with maintainer; start preparing the Track 2 schedule retune (A4) and <code>coordinate_descent_tuning</code> harness (A2) so they&rsquo;re ready to bundle once the winning variant is validated on Track 1.</li>
-  <li><strong>Week 3</strong>: TriLU Phase 3a (Track 1 validation, p&lt;0.01). Simultaneously prepare Track 2 PR with A1 + A2 + retuned schedule (A4) bundled. Goal: submit Track 1 PR and have Track 2 PR ready within 24&ndash;48 hours of merge.</li>
-  <li><strong>Week 4</strong>: TriLU Phase 3b (Track 2 validation with A1+A2+A4 bundle). Submit Track 2 PR. Maximize the chance of holding both records in the same window.</li>
+  <li><strong>Week 2</strong>: TriLU Phase 1.5 (co-tuning on single rented H100, ~$50&ndash;100). Sweep init std, softcap, and Muon LR around the leading Phase 1 variant on the real modded-nanogpt code. Goal: a TriLU-tuned hyperparameter set distinct from the ReLU&sup2;-tuned current settings. Without this, the Phase 3 comparison is methodologically incomplete.</li>
+  <li><strong>Week 3</strong>: TriLU Phase 2 (fused kernel) on single rented H100, conditional on Phase 1.5 results showing TriLU competitive after retuning. If TriLU wins, build the fused <code>Linear&rarr;TriLU&rarr;Linear</code> kernel. If Phase 1 / Phase 1.5 showed gating dominates, the kernel work pivots to a fused gated-MLP. In parallel: open a Track 2 discussion thread; start preparing the Track 2 schedule retune (A4) and <code>coordinate_descent_tuning</code> harness (A2).</li>
+  <li><strong>Week 4</strong>: TriLU Phase 3a (Track 1 validation, p&lt;0.01) using co-tuned hyperparameters from Phase 1.5. Simultaneously prepare Track 2 PR with A1 (TriLU + Track-2 co-tune) + A2 + retuned schedule (A4) bundled. Goal: submit Track 1 PR and have Track 2 PR ready within 24&ndash;48 hours of merge.</li>
+  <li><strong>Week 5</strong>: TriLU Phase 3b (Track 2 validation with A1+A2+A4 bundle, using Track-2 co-tuned hyperparameters). Submit Track 2 PR. Maximize the chance of holding both records in the same window.</li>
   <li><strong>Weeks 5+</strong>: A3 (port study) as the longer-arc writeup project. B-tier work conditional on results. B1 fused gated-MLP kernel work if Phase 1 / Phase 3 showed gating helps; B2 / B3 if the port study has identified concrete missing pieces.</li>
 </ol>
 
@@ -592,6 +593,45 @@ This is the cleanest possible test of the hypothesis &ldquo;ReLU&sup2; won this 
   <li>If gated and non-gated tie &rarr; cheaper kernel wins. Probably TriLU in the standard MLP (no third matmul).</li>
 </ul>
 
+<h3>Phase 1.5: Co-tuning hyperparameters around TriLU (single H100, ~$50&ndash;100)</h3>
+
+<div class="warn">
+<strong>Methodological caveat addressed here.</strong> Phase 1 holds hyperparameters constant across variants &mdash; useful as a quick filter, but a clean "is TriLU better than ReLU&sup2;" test requires both activations to be at <em>their own</em> tuned hyperparameters. The current modded-nanogpt setup (init std <code>0.5/&radic;d</code>, logit softcap, specific Muon LR, certain gate inits) was co-tuned around ReLU&sup2;&rsquo;s shape and unboundedness. Dropping TriLU in with all of these unchanged measures "TriLU at ReLU&sup2;-tuned settings," not "TriLU at its best."
+</div>
+
+<p>This is a known problem in ML benchmark methodology &mdash; <em>hyperparameter coupling</em>. The classical demonstration is &ldquo;Bag of Tricks for Image Classification&rdquo; (He et al. 2019) which showed that the apparent ranking of architectures often changes dramatically when each gets its own tuned hyperparameters.</p>
+
+<p><strong>Strongly-coupled hyperparameters to retune for TriLU:</strong></p>
+
+<table>
+<tr><th>Hyperparameter</th><th>Current (ReLU&sup2;-tuned)</th><th>TriLU sweep range</th><th>Why it&rsquo;s coupled</th></tr>
+<tr><td>Init std (linear layers)</td><td><code>0.5 &times; model_dim<sup>-0.5</sup></code></td><td>{0.5, 0.7, 1.0, 1.4} &times; <code>model_dim<sup>-0.5</sup></code></td><td>ReLU&sup2; has &sigma;&#8308; variance scaling forcing a small init; TriLU has bounded slope so larger init may work. Vanilla Kaiming would be &radic;2/&radic;d.</td></tr>
+<tr><td>Logit softcap value</td><td>15</td><td>{15, 30, &infin; (disabled)}</td><td>Softcap was designed to bound ReLU&sup2;&rsquo;s unbounded growth. TriLU is bounded by construction; softcap may be unnecessary or differently-valued.</td></tr>
+<tr><td>Muon LR</td><td>current value</td><td>{0.7, 1.0, 1.3} &times; current</td><td>Different activation magnitudes need different LRs to stay in the productive regime. Typical sensitivity: 20&ndash;30%.</td></tr>
+<tr><td>Optional: Adam LR (biases, lambdas)</td><td>current value</td><td>{0.7, 1.0, 1.3} &times; current</td><td>Same reasoning, smaller effect.</td></tr>
+</table>
+
+<p><strong>What to hold constant:</strong> zero-init projections (this is structural, not activation-specific), gate inits, batch size schedule, sliding window schedule, attention parameters. These aren&rsquo;t strongly coupled to activation choice.</p>
+
+<p><strong>Sweep design</strong> (smart, not exhaustive):</p>
+
+<ul>
+  <li>Don&rsquo;t do a full grid &mdash; that&rsquo;s 4 &times; 3 &times; 3 = 36 configs &times; 3 seeds = expensive</li>
+  <li>Instead: vary one hyperparameter at a time around the ReLU&sup2;-tuned values, picking the best. ~12 configs &times; 3 seeds = 36 runs.</li>
+  <li>Run on single H100 at reduced step count (~500 steps instead of full Track 1 1480) since we&rsquo;re looking for relative ranking, not absolute target hit.</li>
+  <li>Cost estimate: $1&ndash;2/run on Lambda single-H100 = <strong>$50&ndash;100 total</strong>.</li>
+</ul>
+
+<p><strong>Output:</strong> a "TriLU-tuned hyperparameter set" to use in Phase 3 validation. The fair comparison in the eventual PR is then <strong>(ReLU&sup2; at its tuned setup) vs (TriLU at its tuned setup)</strong>, not the naive drop-in.</p>
+
+<p><strong>Three possible Phase 1.5 outcomes:</strong></p>
+
+<ul>
+  <li><strong>TriLU wins at matched settings AND at tuned settings:</strong> unambiguous. Proceed to Phase 2 with confidence.</li>
+  <li><strong>TriLU ties/loses at matched but wins at tuned:</strong> the more interesting outcome &mdash; demonstrates the surrounding scaffolding was ReLU&sup2;-specific. Strong writeup material; proceed to Phase 2.</li>
+  <li><strong>TriLU loses at both:</strong> definitive negative result. Don&rsquo;t spend Phase 2/3 budget; pivot or write up the negative result.</li>
+</ul>
+
 <h3>Phase 2: Fused kernel (single H100, ~$20&ndash;100)</h3>
 
 <p>For TriLU variants that beat or tie ReLU&sup2; in Phase 1, write a fused <code>Linear&rarr;TriLU&rarr;Linear</code> Triton kernel matching the existing record-#59 kernel. Key implementation notes:</p>
@@ -695,7 +735,7 @@ This is the cleanest possible test of the hypothesis &ldquo;ReLU&sup2; won this 
 </ul>
 
 <div class="footer">
-Last updated: 2026-05-23 (revision: clarified GELU as the appropriate fit target — TriLU structurally approximates GELU much better than SiLU; SwiGLU positioned as a "different shape" reference rather than a TriGLU competitor).
+Last updated: 2026-05-26 (revision: added Phase 1.5 co-tuning step to address hyperparameter coupling; ReLU&sup2;-tuned settings (init std, softcap, LR) likely disadvantage TriLU in a drop-in comparison; same caveat added to A3 port study).
 Source repo: <code>aaholmes/nanogpt</code> (private mirror of <code>KellerJordan/modded-nanogpt</code>).
 Phase 1 harness: <code>experiments/trilu/phase1.py</code>.
 This document is a working strategy plan, not a commitment &mdash; revisit and revise as the project evolves.
