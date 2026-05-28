@@ -271,6 +271,14 @@ Or use the <code>gh</code> CLI (<code>gh auth login</code>). Prefer fine-grained
     Mechanism: 4-bit weight matrix (16 discrete values per element) &times; 16-bit per-row trainable scale = high effective precision per output token, since each row can be calibrated to its characteristic logit range. Differentiable end-to-end via straight-through estimator on the quantization step; the scales themselves train cleanly.
     <br><br>
     Estimated win: ~3&ndash;5% step wallclock if quality parity holds. Engineering effort: ~1&ndash;2 weeks for a custom INT4&times;BF16 fused kernel (reference implementations exist in Marlin, AWQ, vLLM&rsquo;s INT4). Must integrate with existing softcap + asymmetric rescale + MTP CE fusion already present in the LM-head pipeline. Plausibly novel as a training-time application; tier-B leverage if TriLU&rsquo;s Phase 1 establishes the activation experiment as worthwhile to pursue further.</td></tr>
+<tr><td>B5</td><td><strong>4-bit weights with per-row FP16 scales for gated MLP W&#8322; (gate matrix).</strong> <em>Conditional on Phase 1 establishing gated MLPs (SwiGLU/GeGLU/TriGLU/xglu) as competitive.</em></td>
+  <td>Same quantization pattern as B4, applied to the gate matrix in a gated MLP block. Each layer&rsquo;s W&#8322; is 768 &times; 2048 (under the (8/3)d hidden-dim convention); going to 4-bit with per-row FP16 scales reduces W&#8322; memory by ~87% and bandwidth on the weight read by ~75% vs BF16 / ~50% vs FP8.
+    <br><br>
+    Why this works for gates specifically: gates in trained networks tend toward near-binary per-channel "on/off" decisions, so 16 discrete values per element + per-output-channel scales preserves the relevant decision boundaries while drastically reducing weight memory. AWQ / SmoothQuant routinely quantize gate matrices to 4-bit at inference without quality loss.
+    <br><br>
+    Estimated win: gate matmul ~30&ndash;50% faster &rarr; ~10&ndash;15% of MLP time &rarr; <strong>~3&ndash;5% step wallclock</strong>. Engineering effort similar to B4 (~1&ndash;2 weeks). Could extend to W&#8321; (activation matrix) and W&#8323; (output matrix) for additive savings, though those have less binary-like behavior and may show more quality sensitivity.
+    <br><br>
+    <strong>Dependency chain:</strong> Phase 1 must first show gated MLPs viable. If Phase 1 ranks ReLU&sup2; / TriLU above SwiGLU / GeGLU / TriGLU, this idea is moot for modded-nanogpt.</td></tr>
 </table>
 
 <h3>Tier C: Worth considering, more speculative</h3>
@@ -289,6 +297,14 @@ Or use the <code>gh</code> CLI (<code>gh auth login</code>). Prefer fine-grained
   <td>Hinge-style margin loss as an auxiliary term to CE. Used heavily in face recognition / contrastive learning, rare in LM training because CE already does soft margin work. Cheap to test (just add the term with a small weight); high risk of being neutral or harmful if it distorts the loss landscape away from val-CE minimization. Worth ~1 hour of code to try, not worth ~$50 of validation budget unless Phase 1 motivates it.</td></tr>
 <tr><td>C6</td><td><strong>Trainable temperature (standalone, without 4-bit weights).</strong></td>
   <td>A learnable scalar <code>&tau;</code> or per-vocab vector applied as <code>logits / &tau;</code>. Not redundant with softcap (different operation: linear division vs nonlinear tanh saturation). But without 4-bit weight precision pressure, the temperature&rsquo;s effect is largely absorbable by the LM-head weight matrix itself, so the marginal gain is small. Real value only emerges paired with low-precision weights (see B4).</td></tr>
+<tr><td>C7</td><td><strong>Reduced-input gate</strong> (half input or low-rank decomposition for W&#8322; in gated MLPs).</td>
+  <td>Make the gate W&#8322; act on only half the input channels &mdash; <code>(d/2) &times; 2048</code> instead of <code>d &times; 2048</code> &mdash; or equivalently use a low-rank decomposition <code>W&#8322; = U&middot;V</code> with intermediate dim <code>k &lt; d</code>. Halves gate parameter count, gate matmul FLOPs, and gate input bandwidth.
+    <br><br>
+    Estimated win: ~50% faster gate matmul &rarr; ~4&ndash;6% step wallclock. Stacks with B5 (4-bit weights) for ~5&ndash;7% combined.
+    <br><br>
+    Quality risk is higher than B5: the gate now has less information about the input. May fail for fine-grained gating decisions. Worth testing the sensitivity curve (sweep <code>k</code> from <code>d</code> down to <code>d/8</code>) to find the smallest <code>k</code> that doesn&rsquo;t hurt val loss. Similar in spirit to grouped query attention (GQA), which works because attention K/V don&rsquo;t need full-rank representations.
+    <br><br>
+    <strong>Dependency:</strong> same as B5 &mdash; conditional on Phase 1 establishing gated MLPs as viable.</td></tr>
 </table>
 
 <h3>Tier D: Long shots; only attempt if specifically motivated</h3>
@@ -755,7 +771,7 @@ This is the cleanest possible test of the hypothesis "GELU shape vs ReLU&sup2; s
 </ul>
 
 <div class="footer">
-Last updated: 2026-05-28 (revision: added B4 4-bit LM head + trainable per-output-token FP16 scales as a post-TriLU candidate; C5 margin-loss aux; C6 trainable temperature; clarified that temperature is NOT redundant with softcap).
+Last updated: 2026-05-28 (revisions: added B5 4-bit gated MLP W&#8322; (conditional on gated viability) and C7 half-input/low-rank gate; added xglu (gated x*|x|) as 7th Phase 1 variant testing whether using the negative half of the input distribution beats zeroing it).
 Source repo: <code>aaholmes/nanogpt</code> (private mirror of <code>KellerJordan/modded-nanogpt</code>).
 Phase 1 harness: <code>experiments/trilu/phase1.py</code>.
 This document is a working strategy plan, not a commitment &mdash; revisit and revise as the project evolves.
