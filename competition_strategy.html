@@ -265,6 +265,12 @@ Or use the <code>gh</code> CLI (<code>gh auth login</code>). Prefer fine-grained
     Each is a clean unit of work with a clean ablation. Risk: maintainer may queue a bulk transfer instead of merging individually &mdash; <strong>open a GH Discussion first</strong> to confirm intent.</td></tr>
 <tr><td>B3</td><td><strong>Snoo &amp; EMA optimizer wrappers</strong> (Track 2-specific records #12&ndash;14).</strong></td>
   <td>Already proven on Medium pre-bulk-transfer, but the post-bulk codebase doesn&rsquo;t have them. Reintegration + retuning should yield record. Modest engineering; algorithmic risk is low.</td></tr>
+<tr><td>B4</td><td><strong>4-bit LM head with trainable per-output-token FP16 scales.</strong></td>
+  <td>The LM head (768 &times; 50304) is currently FP8 (records #19, #67). Going to 4-bit weights paired with trainable per-row FP16 scales (one scalar per vocab token) potentially halves HBM bandwidth on the bandwidth-bound LM-head weight read while preserving precision via the per-token scales (standard pattern in GPTQ / AWQ / SmoothQuant, but applied at <em>training time</em> rather than post-hoc).
+    <br><br>
+    Mechanism: 4-bit weight matrix (16 discrete values per element) &times; 16-bit per-row trainable scale = high effective precision per output token, since each row can be calibrated to its characteristic logit range. Differentiable end-to-end via straight-through estimator on the quantization step; the scales themselves train cleanly.
+    <br><br>
+    Estimated win: ~3&ndash;5% step wallclock if quality parity holds. Engineering effort: ~1&ndash;2 weeks for a custom INT4&times;BF16 fused kernel (reference implementations exist in Marlin, AWQ, vLLM&rsquo;s INT4). Must integrate with existing softcap + asymmetric rescale + MTP CE fusion already present in the LM-head pipeline. Plausibly novel as a training-time application; tier-B leverage if TriLU&rsquo;s Phase 1 establishes the activation experiment as worthwhile to pursue further.</td></tr>
 </table>
 
 <h3>Tier C: Worth considering, more speculative</h3>
@@ -279,6 +285,10 @@ Or use the <code>gh</code> CLI (<code>gh auth login</code>). Prefer fine-grained
   <td>Was tuned for Medium pre-bulk; current code uses Small&rsquo;s. Cheap to study, modest payoff.</td></tr>
 <tr><td>C4</td><td><strong>Activation/init/softcap co-tuning.</strong> <em>Promoted to Phase 1.5 of A1 &mdash; see Section 7.</em></td>
   <td>The interesting frontier in activations isn&rsquo;t the activation alone &mdash; it&rsquo;s coordinated retuning of init scales, softcap value, FP8 quant scales <em>around</em> the activation. This is no longer "speculative tier C" but a necessary step in any honest TriLU comparison. The current modded-nanogpt hyperparameters (especially init std and softcap) are tuned around ReLU&sup2;&rsquo;s &sigma;&#8308; variance scaling; TriLU&rsquo;s bounded slope likely tolerates different settings.</td></tr>
+<tr><td>C5</td><td><strong>Margin-style auxiliary loss</strong> (<code>&sum;<sub>i</sub> max(0, -logit_true + logit_i + threshold)</code>).</td>
+  <td>Hinge-style margin loss as an auxiliary term to CE. Used heavily in face recognition / contrastive learning, rare in LM training because CE already does soft margin work. Cheap to test (just add the term with a small weight); high risk of being neutral or harmful if it distorts the loss landscape away from val-CE minimization. Worth ~1 hour of code to try, not worth ~$50 of validation budget unless Phase 1 motivates it.</td></tr>
+<tr><td>C6</td><td><strong>Trainable temperature (standalone, without 4-bit weights).</strong></td>
+  <td>A learnable scalar <code>&tau;</code> or per-vocab vector applied as <code>logits / &tau;</code>. Not redundant with softcap (different operation: linear division vs nonlinear tanh saturation). But without 4-bit weight precision pressure, the temperature&rsquo;s effect is largely absorbable by the LM-head weight matrix itself, so the marginal gain is small. Real value only emerges paired with low-precision weights (see B4).</td></tr>
 </table>
 
 <h3>Tier D: Long shots; only attempt if specifically motivated</h3>
@@ -745,7 +755,7 @@ This is the cleanest possible test of the hypothesis "GELU shape vs ReLU&sup2; s
 </ul>
 
 <div class="footer">
-Last updated: 2026-05-27 (revision: calibrated expectations based on record #5&rsquo;s inline note "~1-2% better than GELU" &mdash; TriLU&rsquo;s expected magnitude is modest, ~0-2% wallclock at best; conditional probabilities revised down).
+Last updated: 2026-05-28 (revision: added B4 4-bit LM head + trainable per-output-token FP16 scales as a post-TriLU candidate; C5 margin-loss aux; C6 trainable temperature; clarified that temperature is NOT redundant with softcap).
 Source repo: <code>aaholmes/nanogpt</code> (private mirror of <code>KellerJordan/modded-nanogpt</code>).
 Phase 1 harness: <code>experiments/trilu/phase1.py</code>.
 This document is a working strategy plan, not a commitment &mdash; revisit and revise as the project evolves.
