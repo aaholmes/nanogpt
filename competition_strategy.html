@@ -71,6 +71,7 @@
   <li><a href="#landscape">Strategic Landscape: Track 1 vs Track 2</a></li>
   <li><a href="#ideas">Ideas Ranked by Leverage</a></li>
   <li><a href="#activation">Detailed Plan: TriLU Activation Function Experiment</a></li>
+  <li><a href="#synthesis">Synthesis: Combined Optimization Potential &amp; Prioritization</a></li>
   <li><a href="#risks">Risks &amp; Open Questions</a></li>
 </ol>
 </div>
@@ -758,7 +759,144 @@ This is the cleanest possible test of the hypothesis "GELU shape vs ReLU&sup2; s
 
 <p>If the bounded variant shows promise but doesn&rsquo;t quite clear the record, consider co-tuning the surrounding scaffolding (Tier C4 idea): re-evaluate init scales, logit softcap, FP8 quant scales <em>around</em> the new activation. The reason this hasn&rsquo;t worked for prior activation tweaks is precisely that the surrounding code is tuned for ReLU&sup2;&rsquo;s unboundedness. A bounded activation should let you tighten everything else.</p>
 
-<h2 id="risks">8. Risks &amp; Open Questions</h2>
+<h2 id="synthesis">8. Synthesis: Combined Optimization Potential &amp; Prioritization</h2>
+
+<p>This section ties the individual ideas together into a coherent multi-month plan and addresses the question: <em>what should we work on first?</em></p>
+
+<h3>The combined optimization stack</h3>
+
+<p>Four ideas in the doc target related parts of the model:</p>
+
+<ul>
+  <li><strong>A1: TriLU activation</strong> (Phase 1/1.5/2/3) &mdash; activation shape question</li>
+  <li><strong>B4: 4-bit LM head + trainable per-token scales</strong> &mdash; LM head precision/bandwidth</li>
+  <li><strong>B5: 4-bit gated MLP W&#8322; with per-row scales</strong> &mdash; gate matrix precision</li>
+  <li><strong>C7: Pooled gate input</strong> (Squeeze-and-Excitation pattern) &mdash; gate matrix shape</li>
+</ul>
+
+<p>Stacked, these target different bottlenecks (LM head bandwidth, gate matmul compute/bandwidth, activation shape) and combine non-trivially. Honest per-component impact:</p>
+
+<table>
+<tr><th>Component</th><th>Step wallclock impact</th><th>Mechanism</th></tr>
+<tr><td>A1 (TriLU + co-tuning)</td><td>0.5&ndash;2%</td><td>Per-step quality improvement (fewer steps to target); activation cost unchanged</td></tr>
+<tr><td>B4 (4-bit LM head)</td><td>2&ndash;4%</td><td>HBM bandwidth on LM head weight read</td></tr>
+<tr><td>B5 (4-bit gate W&#8322;) alone</td><td>0.5&ndash;1.5%</td><td>Gate matmul is compute-bound at modded-nanogpt batch size, so bandwidth savings are small. Mainly memory.</td></tr>
+<tr><td>C7 (pooled gate, k=10) alone</td><td>7&ndash;10%</td><td>10&times; reduction in gate matmul FLOPs &mdash; this is the biggest single-component win</td></tr>
+</table>
+
+<p><strong>Stacking is sub-additive</strong> because B5 and C7 target the same matmul:</p>
+
+<table>
+<tr><th>Combination</th><th>Step wallclock savings</th></tr>
+<tr><td>B4 alone</td><td>2&ndash;4%</td></tr>
+<tr><td>A1 + B4</td><td>3&ndash;6%</td></tr>
+<tr><td>B4 + C7 (gated, pooled, FP8 gate weights)</td><td>9&ndash;14%</td></tr>
+<tr><td><strong>A1 + B4 + B5 + C7 (full stack)</strong></td><td><strong>10&ndash;15%</strong></td></tr>
+</table>
+
+<p>For context: <strong>recent Track 1 records improve by 0.5&ndash;2 seconds each (0.5&ndash;2%)</strong>. A 10&ndash;15% improvement (~10&ndash;13 seconds out of ~85 s) would be the largest single record in over a year and roughly equivalent to 5&ndash;10 stacked recent records.</p>
+
+<h3>Probability-weighted expected value</h3>
+
+<p>This isn't free money. Each component is conditional on something:</p>
+
+<table>
+<tr><th>Outcome scenario</th><th>Rough probability</th><th>Realized savings</th></tr>
+<tr><td>Full stack works (best case)</td><td>5&ndash;15%</td><td>10&ndash;15%</td></tr>
+<tr><td>A1 + B4 + C7 work, B5 marginal</td><td>15&ndash;25%</td><td>9&ndash;14%</td></tr>
+<tr><td>A1 + B4 only (gated direction fails)</td><td>30&ndash;40%</td><td>3&ndash;6%</td></tr>
+<tr><td>Quality holds but kernel engineering eats win</td><td>10&ndash;20%</td><td>0&ndash;2%</td></tr>
+<tr><td>Nothing works for this benchmark</td><td>20&ndash;30%</td><td>0%</td></tr>
+</table>
+
+<p>Probability-weighted expected savings: <strong>~4&ndash;7% step wallclock</strong>. Headline-record territory if the stars align; the median outcome is more modest.</p>
+
+<h3>Decision tree based on Phase 1 outcome</h3>
+
+<p>Phase 1 (the 7-variant TriLU/gated sweep) is the cheapest source of strategic information we have. It informs all downstream work:</p>
+
+<pre><code>┌───────────────────────────────────────────────────────────┐
+│ Phase 1 (TriLU sweep, ~14 hr unattended on RTX 5060 Ti)   │
+│ Outputs: val loss curves + dead-zone fractions +          │
+│          (L,R,α) trajectories for all 7 activations       │
+└───────────────────────┬───────────────────────────────────┘
+                        │
+        ┌───────────────┼───────────────┐
+        │               │               │
+        ▼               ▼               ▼
+ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐
+ │ Frozen      │ │ Gated wins  │ │ All tie     │
+ │ TriLU wins  │ │ (SwiGLU/    │ │             │
+ │             │ │  GeGLU/     │ │             │
+ │             │ │  TriGLU/    │ │             │
+ │             │ │  xglu)      │ │             │
+ └──────┬──────┘ └──────┬──────┘ └──────┬──────┘
+        │               │               │
+        ▼               ▼               ▼
+ Phase 1.5 →     Phase 1.5 for    B4 only
+ Phase 2 →       gated variant +  (LM head)
+ Phase 3         B4 + B5 + C7     ~2-4% target
+                 ~10-15% target
+</code></pre>
+
+<p><strong>Three concrete paths:</strong></p>
+
+<ol>
+  <li><strong>Frozen TriLU (or learnable TriLU) wins Phase 1:</strong> proceed with the original TriLU plan (Phase 1.5 co-tuning, Phase 2 fused kernel, Phase 3 validation). Expected savings ~1&ndash;2% &mdash; modest record. Total effort ~3&ndash;4 weeks. Pair with B4 (LM head 4-bit) as an independent post-TriLU project. Combined target: <strong>~3&ndash;6%</strong>.</li>
+
+  <li><strong>A gated variant wins Phase 1:</strong> the full stack becomes plausible. Sequence:
+    <ol type="a">
+      <li>Phase 1.5: co-tune init/softcap/LR around the winning gated variant on real modded-nanogpt code (~1 week)</li>
+      <li>Phase 2: build fused gated-MLP Triton kernel with the winning activation (~2 weeks)</li>
+      <li>Phase 3 validation (Track 1, then Track 2)</li>
+      <li>B4 in parallel: independent project, no conflict with the gated MLP work (~2 weeks)</li>
+      <li>B5 + C7: extends the fused gated-MLP kernel with 4-bit quantization + pooled gate input (~2&ndash;3 weeks)</li>
+    </ol>
+    Total: ~6&ndash;8 weeks for the full stack. Combined target: <strong>~10&ndash;15%</strong>.</li>
+
+  <li><strong>Everything ties or non-gated barely wins Phase 1:</strong> focus on B4 alone (~2 weeks, ~2&ndash;4% wallclock). Skip the gated MLP direction. Document the Phase 1 result as a clean negative finding for the writeup. Combined target: <strong>~2&ndash;4%</strong>.</li>
+</ol>
+
+<h3>Should TriLU come first, or the full quantization stack?</h3>
+
+<p>This is the prioritization question. <strong>The right answer is: run Phase 1 first, because it informs everything else and is nearly free.</strong></p>
+
+<p>Phase 1 is already coded (<code>experiments/trilu/phase1.py</code>) and runs in ~14 hours unattended on a local RTX 5060 Ti. The compute cost is essentially zero, and the strategic information it produces is what determines whether the full stack is viable.</p>
+
+<p>After Phase 1, the prioritization is:</p>
+
+<table>
+<tr><th>Project</th><th>Engineering time</th><th>Expected savings</th><th>Best-case savings</th><th>Variance</th></tr>
+<tr><td>TriLU (alone)</td><td>2&ndash;4 weeks</td><td>1&ndash;2%</td><td>~3%</td><td>Low</td></tr>
+<tr><td>B4 (LM head 4-bit, independent of Phase 1)</td><td>1&ndash;2 weeks</td><td>2&ndash;4%</td><td>~5%</td><td>Medium</td></tr>
+<tr><td><strong>Full stack (A1 + B4 + B5 + C7)</strong></td><td>~6&ndash;8 weeks</td><td><strong>4&ndash;7%</strong></td><td><strong>~15%</strong></td><td><strong>High</strong></td></tr>
+</table>
+
+<p>The full stack is a larger, riskier, higher-payoff project. Roughly:</p>
+<ul>
+  <li>~4&times; the engineering time vs TriLU alone</li>
+  <li>~3&ndash;5&times; the expected savings</li>
+  <li>~5&times; the variance (much higher upside if it works, comparable downside if it doesn&rsquo;t)</li>
+</ul>
+
+<p><strong>Recommendation given the user&rsquo;s stated goals (learning + portfolio for job search):</strong></p>
+
+<ol>
+  <li><strong>Run Phase 1 immediately</strong> (week 0&ndash;1). Cost: ~$0, output: strategic information.</li>
+  <li><strong>If gated wins Phase 1</strong>: pursue the full stack. The combined ~10&ndash;15% wallclock target is a once-in-a-year record opportunity, and the engineering portfolio it builds (fused MLP kernels with 4-bit quantization, pooled gating, custom Triton) is exceptional for AI-systems roles. Cost: ~$1500&ndash;3000 in compute over ~2 months.</li>
+  <li><strong>If non-gated wins Phase 1</strong>: focus on TriLU Phase 2/3 + B4 LM head in parallel. Smaller record opportunity but high probability of landing something, and the writeup is the deliverable either way. Cost: ~$500&ndash;1000 over ~3&ndash;4 weeks.</li>
+  <li><strong>If everything ties</strong>: B4 alone, plus write up the negative result on activations. Cost: ~$200&ndash;500 over ~2 weeks.</li>
+</ol>
+
+<p>In all three paths, the deliverable is a writeup with concrete empirical findings and (with luck) one or more records. The full stack maximizes upside; the smaller paths minimize variance.</p>
+
+<h3>One non-obvious consideration: the Track 1 buffer rule</h3>
+
+<p>Discretionary rule #2 (the loss buffer) interacts with all of these in the same way: any new technique must produce a <em>wallclock saving at equivalent loss</em>, not a loss improvement at equivalent wallclock. A 5% step time saving with 0.001 worse loss may still be net-negative for the record after reducing step count to recover the buffer.</p>
+
+<p>This is why the realistic expected values above are below the naive "FLOPs / bandwidth saved" numbers &mdash; some of the saving gets re-invested in extra steps to maintain the buffer position.</p>
+
+<h2 id="risks">9. Risks &amp; Open Questions</h2>
 
 <h3>Risks</h3>
 
@@ -782,7 +920,7 @@ This is the cleanest possible test of the hypothesis "GELU shape vs ReLU&sup2; s
 </ul>
 
 <div class="footer">
-Last updated: 2026-05-28 (revisions: expanded C7 to cover pooled-input gate (Squeeze-and-Excitation pattern) as the recommended variant at higher k; at k=10 estimated ~7&ndash;10% step wallclock if quality holds; added B5 4-bit gated MLP W&#8322; (conditional on gated viability); added xglu as 7th Phase 1 variant).
+Last updated: 2026-05-28 (revisions: new section 8 "Synthesis" ties the optimization stack together &mdash; full stack target ~10&ndash;15% wallclock if Phase 1 favors gated MLPs; recommends running Phase 1 first as the cheapest source of strategic information; conditional 3-path plan based on Phase 1 outcome).
 Source repo: <code>aaholmes/nanogpt</code> (private mirror of <code>KellerJordan/modded-nanogpt</code>).
 Phase 1 harness: <code>experiments/trilu/phase1.py</code>.
 This document is a working strategy plan, not a commitment &mdash; revisit and revise as the project evolves.
