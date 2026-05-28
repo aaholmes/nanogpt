@@ -20,6 +20,8 @@ COLORS = {
     "swiglu": "#cc4530",
     "geglu": "#d97f3f",
     "triglu": "#7a2d8c",
+    "xabsx": "#3a7ac8",
+    "xglu": "#d4af37",
 }
 
 

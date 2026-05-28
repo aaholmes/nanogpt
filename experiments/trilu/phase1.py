@@ -48,6 +48,20 @@ class ReLU2(nn.Module):
         return F.relu(x).square()
 
 
+class XAbsX(nn.Module):
+    """f(x) = x * |x| = sign(x) * x²
+
+    Odd function (f(-x) = -f(x)). In a gated MLP with a linear gate, mean and skew
+    of the output are automatically 0 (the gate's symmetry handles those, same as
+    for SwiGLU/GeGLU/TriGLU); the distinguishing hypothesis for x|x| is using the
+    *negative* half of the input distribution rather than zeroing it out like
+    ReLU/ReLU² do. E[(z|z|)²] = E[z⁴] = 3 for z ~ N(0,1), so the natural init
+    scaling for the gate branch is Var[W₂x] = 1/3 if you want output variance 1.
+    """
+    def forward(self, x):
+        return x * x.abs()
+
+
 def _inv_softplus(y: float) -> float:
     """Numerically stable inverse of softplus: returns theta s.t. softplus(theta) = y, y > 0."""
     return math.log(math.expm1(y)) if y < 20 else y
@@ -134,11 +148,13 @@ def make_activation(name: str, init: str = "gelu_minimax"):
         return TriLU(asymmetric=False, init=init)
     if name in ("trilu_asym", "triglu"):
         return TriLU(asymmetric=True, init=init)
+    if name in ("xabsx", "xglu"):
+        return XAbsX()
     raise ValueError(f"Unknown activation: {name}")
 
 
 # Activations that use gated MLP (3 matmuls, hidden dim = round(8/3 * model_dim))
-GATED_ACTIVATIONS = {"swiglu", "geglu", "triglu"}
+GATED_ACTIVATIONS = {"swiglu", "geglu", "triglu", "xglu"}
 
 
 # -----------------------------------------------------------------------------
@@ -477,11 +493,13 @@ CONFIGS = {
 }
 
 
-ALL_ACTIVATIONS = ["relu2", "gelu", "trilu_sym", "trilu_asym", "swiglu", "geglu", "triglu"]
+ALL_ACTIVATIONS = ["relu2", "gelu", "trilu_sym", "trilu_asym", "swiglu", "geglu", "triglu",
+                   "xabsx", "xglu"]
 
-# Default 6-activation sweep covering the standard/gated x ReLU-like/GELU-like/TriLU comparison.
-# At 1000 steps, 3 seeds, ~40 min/run on 5060 Ti, total ~12 hr.
-DEFAULT_ACTIVATIONS = ["relu2", "gelu", "trilu_asym", "swiglu", "geglu", "triglu"]
+# Default 7-activation sweep covering the standard/gated x ReLU-like/GELU-like/TriLU comparison,
+# plus xglu (gated x|x|) which tests using the negative half of the input distribution.
+# At 1000 steps, 3 seeds, ~40 min/run on 5060 Ti, total ~14 hr.
+DEFAULT_ACTIVATIONS = ["relu2", "gelu", "trilu_asym", "swiglu", "geglu", "triglu", "xglu"]
 
 
 def main():
