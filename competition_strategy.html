@@ -297,12 +297,23 @@ Or use the <code>gh</code> CLI (<code>gh auth login</code>). Prefer fine-grained
   <td>Hinge-style margin loss as an auxiliary term to CE. Used heavily in face recognition / contrastive learning, rare in LM training because CE already does soft margin work. Cheap to test (just add the term with a small weight); high risk of being neutral or harmful if it distorts the loss landscape away from val-CE minimization. Worth ~1 hour of code to try, not worth ~$50 of validation budget unless Phase 1 motivates it.</td></tr>
 <tr><td>C6</td><td><strong>Trainable temperature (standalone, without 4-bit weights).</strong></td>
   <td>A learnable scalar <code>&tau;</code> or per-vocab vector applied as <code>logits / &tau;</code>. Not redundant with softcap (different operation: linear division vs nonlinear tanh saturation). But without 4-bit weight precision pressure, the temperature&rsquo;s effect is largely absorbable by the LM-head weight matrix itself, so the marginal gain is small. Real value only emerges paired with low-precision weights (see B4).</td></tr>
-<tr><td>C7</td><td><strong>Reduced-input gate</strong> (half input or low-rank decomposition for W&#8322; in gated MLPs).</td>
-  <td>Make the gate W&#8322; act on only half the input channels &mdash; <code>(d/2) &times; 2048</code> instead of <code>d &times; 2048</code> &mdash; or equivalently use a low-rank decomposition <code>W&#8322; = U&middot;V</code> with intermediate dim <code>k &lt; d</code>. Halves gate parameter count, gate matmul FLOPs, and gate input bandwidth.
+<tr><td>C7</td><td><strong>Compressed gate input</strong> (pooled or truncated, for W&#8322; in gated MLPs).</td>
+  <td>Reduce the gate input dimension before the W&#8322; matmul. Two variants in increasing risk-and-savings order:
     <br><br>
-    Estimated win: ~50% faster gate matmul &rarr; ~4&ndash;6% step wallclock. Stacks with B5 (4-bit weights) for ~5&ndash;7% combined.
+    <strong>(a) Naive truncation</strong>: gate sees only first <code>d/k</code> channels of input. W&#8322; becomes <code>(d/k) &times; 2048</code>. Saves <code>k&times;</code> on params and FLOPs, but hostage to whichever channels happen to carry important signal.
     <br><br>
-    Quality risk is higher than B5: the gate now has less information about the input. May fail for fine-grained gating decisions. Worth testing the sensitivity curve (sweep <code>k</code> from <code>d</code> down to <code>d/8</code>) to find the smallest <code>k</code> that doesn&rsquo;t hurt val loss. Similar in spirit to grouped query attention (GQA), which works because attention K/V don&rsquo;t need full-rank representations.
+    <strong>(b) Cheap pooling</strong> (recommended): group input channels into <code>d/k</code> groups, apply mean/max/L2 pooling within each group, then feed the pooled <code>d/k</code>-dim vector to W&#8322;. Same gate matmul cost as (a), but the gate sees a <em>compressed summary of all input channels</em> rather than just a fraction. The pooling itself is essentially free (~0.3% overhead vs the gate matmul). This is structurally the <strong>Squeeze-and-Excitation pattern</strong> (Hu et al. 2018), which is proven to work in vision &mdash; SE blocks use global average pooling before a small MLP to compute per-channel attention scores.
+    <br><br>
+    <strong>Estimated savings at <code>k=10</code>:</strong>
+    <ul style="margin: 0.3em 0;">
+      <li>Gate matmul FLOPs reduced ~90%</li>
+      <li>Gate matmul becomes ~3% of its original compute &rarr; MLP time drops ~27% &rarr; <strong>~7&ndash;10% step wallclock</strong> if quality holds</li>
+      <li>Stacks with B5 (4-bit weights) for combined wallclock impact in the same range plus a memory win</li>
+    </ul>
+    <br>
+    <strong>Quality risk grows with <code>k</code>.</strong> At <code>k=2</code> (half-input), risk is mild &mdash; gates still see substantial input info. At <code>k=10</code>, the gate is making decisions based on a 10&times;-compressed summary; quality can collapse if gate decisions need fine-grained per-channel info. Sweep <code>k &isin; {2, 4, 8, 16}</code> with pooled variant to find the threshold.
+    <br><br>
+    <strong>Pooling choice</strong>: max preserves dominant features per group; mean preserves overall magnitude; mean+max concat doubles gate input dim but preserves both. Fixed pooling (not learned) is the right choice if compute reduction is the goal &mdash; a learned <code>d &rarr; d/k</code> projection just moves the parameters elsewhere via low-rank decomposition.
     <br><br>
     <strong>Dependency:</strong> same as B5 &mdash; conditional on Phase 1 establishing gated MLPs as viable.</td></tr>
 </table>
@@ -771,7 +782,7 @@ This is the cleanest possible test of the hypothesis "GELU shape vs ReLU&sup2; s
 </ul>
 
 <div class="footer">
-Last updated: 2026-05-28 (revisions: added B5 4-bit gated MLP W&#8322; (conditional on gated viability) and C7 half-input/low-rank gate; added xglu (gated x*|x|) as 7th Phase 1 variant testing whether using the negative half of the input distribution beats zeroing it).
+Last updated: 2026-05-28 (revisions: expanded C7 to cover pooled-input gate (Squeeze-and-Excitation pattern) as the recommended variant at higher k; at k=10 estimated ~7&ndash;10% step wallclock if quality holds; added B5 4-bit gated MLP W&#8322; (conditional on gated viability); added xglu as 7th Phase 1 variant).
 Source repo: <code>aaholmes/nanogpt</code> (private mirror of <code>KellerJordan/modded-nanogpt</code>).
 Phase 1 harness: <code>experiments/trilu/phase1.py</code>.
 This document is a working strategy plan, not a commitment &mdash; revisit and revise as the project evolves.
