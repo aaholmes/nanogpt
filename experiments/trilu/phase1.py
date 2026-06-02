@@ -28,6 +28,7 @@ Usage:
 """
 
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -38,6 +39,11 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+@contextlib.contextmanager
+def _nullctx():
+    yield
 
 
 # -----------------------------------------------------------------------------
@@ -354,10 +360,12 @@ def collect_trilu_params(model: nn.Module):
 def evaluate(model, val_data, batch_size, seq_len, device, gen, num_batches=20):
     model.eval()
     losses = []
+    amp_ctx_factory = (lambda: torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)) if device == "cuda" else _nullctx
     for _ in range(num_batches):
         batch = sample_batch(val_data, batch_size, seq_len, device, gen)
         x, y = batch[:, :-1], batch[:, 1:]
-        _, loss = model(x, y)
+        with amp_ctx_factory():
+            _, loss = model(x, y)
         losses.append(loss.item())
     model.train()
     return sum(losses) / len(losses)
@@ -379,7 +387,9 @@ def measure_dead_zones(model, val_data, batch_size, seq_len, device, gen):
     model.eval()
     batch = sample_batch(val_data, batch_size, seq_len, device, gen)
     x, y = batch[:, :-1], batch[:, 1:]
-    model(x, y)
+    amp_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16) if device == "cuda" else _nullctx()
+    with amp_ctx:
+        model(x, y)
     model.train()
     for _, m in mlp_modules:
         m._capture_dead = False
@@ -431,11 +441,14 @@ def train_one(config, train_data, val_data, seed, device):
     for step in range(config["total_steps"]):
         cur_lr = get_lr(step, config["total_steps"], config["lr"], config["lr"] * 0.1, config["warmup"])
         optimizer.param_groups[0]["lr"] = cur_lr
-        optimizer.param_groups[1]["lr"] = cur_lr * 0.1
+        if len(optimizer.param_groups) > 1:
+            optimizer.param_groups[1]["lr"] = cur_lr * 0.1
 
         batch = sample_batch(train_data, config["batch_size"], config["seq_len"], device, gen_train)
         x, y = batch[:, :-1], batch[:, 1:]
-        _, loss = model(x, y)
+        amp_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16) if device == "cuda" else _nullctx()
+        with amp_ctx:
+            _, loss = model(x, y)
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -508,6 +521,7 @@ def main():
     ap.add_argument("--tiny", action="store_true", help="alias for --config tiny")
     ap.add_argument("--seeds", type=int, default=3)
     ap.add_argument("--steps", type=int, default=None, help="override total_steps")
+    ap.add_argument("--batch-size", type=int, default=None, help="override batch_size")
     ap.add_argument("--activations", type=str, default=",".join(DEFAULT_ACTIVATIONS),
                     help="comma-separated subset of: " + ",".join(ALL_ACTIVATIONS))
     ap.add_argument("--init", type=str, default="gelu_minimax",
@@ -528,6 +542,8 @@ def main():
     cfg_base = dict(CONFIGS[args.config])
     if args.steps is not None:
         cfg_base["total_steps"] = args.steps
+    if args.batch_size is not None:
+        cfg_base["batch_size"] = args.batch_size
 
     device = pick_device(args.device)
     print(f"Device: {device}")
