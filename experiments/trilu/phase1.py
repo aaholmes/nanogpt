@@ -209,45 +209,86 @@ class MLP(nn.Module):
         return self.fc2(h)
 
 
-class GatedMLP(nn.Module):
-    """Gated MLP (SwiGLU / GeGLU / TriGLU): W2 . ( act(W1.x) * (V.x) )."""
+class ChannelPool(nn.Module):
+    """Compress the channel dim by factor k via fixed (non-learned) pooling.
 
-    def __init__(self, dim: int, mlp_dim: int, activation: nn.Module):
+    Groups the `dim` input channels into `dim // k` contiguous groups of `k` and
+    pools within each group. This is the Squeeze-and-Excitation-style compression
+    (Hu et al. 2018): the gate sees a k-fold summary of *all* channels rather than
+    a fraction of them, at near-zero cost. Fixed (not learned) on purpose — a
+    learned d -> d/k projection would just move the FLOPs we are trying to remove.
+    """
+
+    def __init__(self, dim: int, k: int, pool_type: str = "mean"):
+        super().__init__()
+        assert dim % k == 0, f"gate-pool factor {k} must divide model dim {dim}"
+        self.dim, self.k, self.pool_type = dim, k, pool_type
+        self.out_dim = dim // k
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        *lead, d = x.shape
+        g = x.view(*lead, self.out_dim, self.k)
+        if self.pool_type == "max":
+            return g.amax(dim=-1)
+        return g.mean(dim=-1)
+
+
+class GatedMLP(nn.Module):
+    """Gated MLP (SwiGLU / GeGLU / TriGLU): W2 . ( act(W1.x) * (V.x) ).
+
+    With gate_pool > 1, the gate branch V sees a channel-pooled summary of the
+    input (C7): x is compressed dim -> dim/k before the gate matmul, so V is
+    (dim/k) x mlp_dim instead of dim x mlp_dim. The activated branch W1 still
+    sees the full input. Tests whether the gate needs fine-grained per-channel
+    info or only a compressed summary.
+    """
+
+    def __init__(self, dim: int, mlp_dim: int, activation: nn.Module,
+                 gate_pool: int = 1, gate_pool_type: str = "mean"):
         super().__init__()
         self.fc1 = nn.Linear(dim, mlp_dim, bias=False)
-        self.fc_gate = nn.Linear(dim, mlp_dim, bias=False)
+        if gate_pool > 1:
+            self.gate_pool = ChannelPool(dim, gate_pool, gate_pool_type)
+            self.fc_gate = nn.Linear(self.gate_pool.out_dim, mlp_dim, bias=False)
+        else:
+            self.gate_pool = None
+            self.fc_gate = nn.Linear(dim, mlp_dim, bias=False)
         self.fc2 = nn.Linear(mlp_dim, dim, bias=False)
         self.act = activation
         self._capture_dead = False
         self._last_dead_frac: float | None = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.act(self.fc1(x)) * self.fc_gate(x)
+        gate_in = self.gate_pool(x) if self.gate_pool is not None else x
+        h = self.act(self.fc1(x)) * self.fc_gate(gate_in)
         if self._capture_dead:
             with torch.no_grad():
                 self._last_dead_frac = (h.abs() < _DEAD_THRESHOLD).float().mean().item()
         return self.fc2(h)
 
 
-def make_mlp(dim: int, model_dim: int, act_name: str, act_init: str) -> nn.Module:
+def make_mlp(dim: int, model_dim: int, act_name: str, act_init: str,
+             gate_pool: int = 1, gate_pool_type: str = "mean") -> nn.Module:
     """Build an MLP block. Hidden dim chosen to match params: 4d for standard, (8/3)d for gated."""
     act = make_activation(act_name, act_init)
     if act_name in GATED_ACTIVATIONS:
         # 8/3 * d, rounded to nearest multiple of 64 for hardware-friendliness
         hidden = max(64, round(8 * model_dim / 3 / 64) * 64)
-        return GatedMLP(dim, hidden, act)
+        return GatedMLP(dim, hidden, act, gate_pool=gate_pool, gate_pool_type=gate_pool_type)
     else:
         hidden = 4 * model_dim
         return MLP(dim, hidden, act)
 
 
 class Block(nn.Module):
-    def __init__(self, dim, num_heads, model_dim, act_name, act_init):
+    def __init__(self, dim, num_heads, model_dim, act_name, act_init,
+                 gate_pool=1, gate_pool_type="mean"):
         super().__init__()
         self.ln1 = nn.LayerNorm(dim)
         self.attn = CausalSelfAttention(dim, num_heads)
         self.ln2 = nn.LayerNorm(dim)
-        self.mlp = make_mlp(dim, model_dim, act_name, act_init)
+        self.mlp = make_mlp(dim, model_dim, act_name, act_init,
+                            gate_pool=gate_pool, gate_pool_type=gate_pool_type)
 
     def forward(self, x):
         x = x + self.attn(self.ln1(x))
@@ -256,13 +297,15 @@ class Block(nn.Module):
 
 
 class TinyGPT(nn.Module):
-    def __init__(self, vocab_size, num_layers, dim, num_heads, seq_len, act_name, act_init):
+    def __init__(self, vocab_size, num_layers, dim, num_heads, seq_len, act_name, act_init,
+                 gate_pool=1, gate_pool_type="mean"):
         super().__init__()
         self.token_embed = nn.Embedding(vocab_size, dim)
         self.pos_embed = nn.Embedding(seq_len, dim)
         # one MLP per layer; gated variants get their own hidden dim sized to match params
         self.blocks = nn.ModuleList([
-            Block(dim, num_heads, dim, act_name, act_init)
+            Block(dim, num_heads, dim, act_name, act_init,
+                  gate_pool=gate_pool, gate_pool_type=gate_pool_type)
             for _ in range(num_layers)
         ])
         self.ln_f = nn.LayerNorm(dim)
@@ -409,6 +452,8 @@ def train_one(config, train_data, val_data, seed, device):
         seq_len=config["seq_len"],
         act_name=config["activation"],
         act_init=config.get("init", "gelu_minimax"),
+        gate_pool=config.get("gate_pool", 1),
+        gate_pool_type=config.get("gate_pool_type", "mean"),
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
@@ -534,6 +579,11 @@ def main():
     ap.add_argument("--freeze-trilu", action="store_true",
                     help="freeze TriLU/TriGLU activation params at their init values (cleanest "
                          "hypothesis test — like-for-like with fixed ReLU²/GELU/etc.)")
+    ap.add_argument("--gate-pool", type=int, default=1,
+                    help="compress gate input by this factor via channel pooling (C7); "
+                         "1 = no pooling. Only affects gated activations.")
+    ap.add_argument("--gate-pool-type", type=str, default="mean", choices=["mean", "max"],
+                    help="pooling op for --gate-pool")
     args = ap.parse_args()
 
     if args.tiny:
@@ -544,6 +594,8 @@ def main():
         cfg_base["total_steps"] = args.steps
     if args.batch_size is not None:
         cfg_base["batch_size"] = args.batch_size
+    cfg_base["gate_pool"] = args.gate_pool
+    cfg_base["gate_pool_type"] = args.gate_pool_type
 
     device = pick_device(args.device)
     print(f"Device: {device}")
@@ -563,11 +615,13 @@ def main():
     all_results = {}
     for act in activations:
         cfg = dict(cfg_base, activation=act, init=args.init, freeze_trilu=args.freeze_trilu)
-        all_results[act] = []
+        # Self-describing key so pooled runs don't collide with k=1 in the same file.
+        key = act if args.gate_pool == 1 else f"{act}_pool{args.gate_pool}{args.gate_pool_type[0]}"
+        all_results[key] = []
         for seed in range(args.seeds):
-            print(f"\n=== activation={act}  seed={seed} ===")
+            print(f"\n=== activation={act}  gate_pool={args.gate_pool}  seed={seed} ===")
             log = train_one(cfg, train_data, val_data, seed, device)
-            all_results[act].append(log)
+            all_results[key].append(log)
             # Save incrementally so a crash doesn't lose everything.
             Path(args.out).parent.mkdir(parents=True, exist_ok=True)
             with open(args.out, "w") as f:
