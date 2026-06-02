@@ -792,13 +792,32 @@ This is the cleanest possible test of the hypothesis "GELU shape vs ReLU&sup2; s
 
 <p><strong>Trajectory plot caveat.</strong> TriLU/TriGLU ran <em>frozen</em> (<code>--freeze-trilu</code>), so the <code>(L, R, &alpha;)</code> trajectory plot is flat by construction and carries no information this run. The &ldquo;does the network want to drift from GELU?&rdquo; question requires a follow-up learnable-TriLU run.</p>
 
+<h3>Cheap-gate follow-up: ReLU&sup2;-gate (reglu)</h3>
+
+<p class="muted">Finding 3 says shape barely matters <em>within the smooth-gate family</em> (GELU/SiLU-like). That motivated testing a qualitatively different, kernel-friendly gate: <strong>reglu</strong> = ReLU&sup2; on the activation branch of a gated MLP (transcendental-free, fusable, reuses the record&nbsp;#59 fused-ReLU&sup2; kernel). Same medium config, 5 seeds, same seed indices as the main sweep (so the comparison is paired). Data: <code>experiments/trilu/results_cheapgate.json</code>. (<code>xglu</code> = gated <em>x|x|</em> is queued in the same run as a second cheap gate; result pending.)</p>
+
+<table>
+<tr><th>Gated variant</th><th>Gate shape</th><th>Mean val</th><th>reglu &minus; it (paired, n=5)</th><th>p</th></tr>
+<tr><td><strong>reglu</strong></td><td>ReLU&sup2; (cheap, fusable)</td><td><strong>6.8487</strong> &plusmn; 0.0485</td><td>&mdash;</td><td>&mdash;</td></tr>
+<tr><td>geglu</td><td>GELU</td><td>6.8901</td><td>&minus;0.0414</td><td>0.00004</td></tr>
+<tr><td>triglu</td><td>TriLU (frozen)</td><td>6.8934</td><td>&minus;0.0447</td><td>0.00007</td></tr>
+<tr><td>swiglu</td><td>SiLU</td><td>6.8988</td><td>&minus;0.0501</td><td>&lt;0.00001</td></tr>
+</table>
+
+<div class="good">
+<strong>Finding 4 &mdash; the cheapest gate is also the best.</strong> reglu beats every smooth-gate variant by ~0.041&ndash;0.050 nats, paired p &lt; 0.0001, winning on essentially every seed. So &ldquo;shape barely matters&rdquo; held only <em>within</em> the smooth-gate family; the sparse / non-negative ReLU&sup2; shape breaks out of the cluster. This mirrors the standard-MLP row, where ReLU&sup2; also won &mdash; a single coherent story: <strong>ReLU&sup2;&rsquo;s sparsity + non-negativity helps in both the standard and the gated MLP.</strong> Strategically near-best-case: the activation that is cheapest to fuse (no transcendentals, existing kernel) is also the most accurate, so the gated-MLP kernel target is now concrete &mdash; a ReLU&sup2;-gate.
+</div>
+
+<p><strong>Caveat (init fairness).</strong> All variants use the shared default <code>nn.Linear</code> init, which is not each activation&rsquo;s variance-optimal init &mdash; so this is a fair <em>drop-in</em> comparison, not yet a pure <em>shape</em> comparison. LayerNorm launders much of the mismatch, and ReLU&sup2; is arguably the activation the generic init suits <em>least</em> (no closed-form init), so its win is hard to dismiss as init-luck. A small init-gain sweep (reglu vs xglu at 2&ndash;3 init scales) is the clean way to separate shape from init before claiming the mechanistic result; queued as a follow-up.</p>
+
 <p>Plots: <code>experiments/trilu/val_loss.png</code> (val loss vs step, mean &plusmn; std band), <code>dead_zones.png</code> (dead-fraction over training), <code>trilu_trajectories.png</code> (flat &mdash; frozen run).</p>
 
 <h3>Implications for strategy</h3>
 <ul>
   <li><strong>Demote A1 (TriLU as the activation).</strong> The clean-shape-test motivation is gone: frozen TriLU is the worst standard variant. A learnable-TriLU run is still worth doing as a secondary test (does drift help?), but the &ldquo;ReLU&sup2; won on cost not shape&rdquo; thesis is dead at this scale. Do <em>not</em> spend H100 budget on frozen-TriLU Track-1 validation.</li>
-  <li><strong>Promote B1 (fused gated-MLP kernel).</strong> Gating is the real, large, significant effect. The natural Phase 2 pivot &mdash; flagged conditionally in the original plan &mdash; is now the main line: build a fused gated-MLP and co-tune it against the full modded-nanogpt stack in Phase 1.5.</li>
+  <li><strong>Promote B1 (fused gated-MLP kernel), with a concrete activation.</strong> Gating is the real, large, significant effect, and Finding 4 names the target: a <strong>ReLU&sup2;-gate</strong> &mdash; cheapest to fuse and the most accurate. The Phase 2 pivot is now the main line: build a fused ReLU&sup2;-gated MLP and co-tune it against the full modded-nanogpt stack in Phase 1.5.</li>
   <li><strong>B5 / C7 dependency conditions are met.</strong> Both were gated on &ldquo;Phase 1 establishing gated MLPs as viable.&rdquo; They are now live: 4-bit gated-W&#8322; quantization (B5) and SE-style compressed gate input (C7) become candidate follow-ons <em>if</em> the gated kernel survives Phase 1.5.</li>
+  <li><strong>Next local round (cheap, before any H100 spend).</strong> Two ~orthogonal sweeps on the reglu winner: (a) <em>activation-shape refinement</em> &mdash; ReLU(x&minus;t)&sup2;+s&middot;ReLU(x&minus;t) at s&isin;{0.5,1}, testing whether a slope-1 floor fixes ReLU&sup2;&rsquo;s gradient-starved slow start; (b) <em>compressed gate input (C7)</em> &mdash; mean-pool the gate by k&isin;{4,8,16} to find where quality collapses. Because pooling acts on the linear gate branch, its threshold is ~independent of the fc1 activation, so the two can run in parallel and the final config combines (best shape) &times; (best k).</li>
   <li><strong>The scale/scaffold caveat still binds.</strong> No Muon / FP8 / softcap here. Gating&rsquo;s 0.087-nat win must be re-confirmed inside <code>train_gpt.py</code> on a single H100 before any record attempt &mdash; Muon&rsquo;s spectral-norm bias and the param-count rebalance ((8/3)d vs 4d hidden) interact with gating in ways this harness can&rsquo;t see.</li>
 </ul>
 
