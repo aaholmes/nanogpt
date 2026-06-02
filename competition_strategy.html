@@ -764,6 +764,8 @@ This is the cleanest possible test of the hypothesis "GELU shape vs ReLU&sup2; s
 
 <p class="muted">Run 2026-06-02. 6 variants &times; 5 seeds &times; 3000 steps. Config: 8 layers, model_dim 512, 8 heads, seq_len 1024, batch 16, bf16 autocast, AdamW. Frozen TriLU/TriGLU (params fixed at minimax GELU-fit, 0 learnable activation params). Self-contained vanilla-PyTorch harness &mdash; <strong>no Muon / FP8 / FA3 / softcap / value embeddings</strong>; this measures activation/MLP-structure quality in isolation, not modded-nanogpt wallclock. Data: <code>experiments/trilu/results_overnight.json</code>; analysis: <code>experiments/trilu/significance.py</code>.</p>
 
+<p><strong>Parameter counts:</strong> standard MLPs (relu2/gelu/trilu) = 51.46M; gated MLPs (geglu/swiglu/triglu) = 51.20M. The gated variants carry ~262K <em>fewer</em> params (gated hidden dim rounds to 1344, a multiple of 64, vs the 4d=2048 standard hidden). So gating wins <em>despite</em> a slight parameter disadvantage &mdash; the effect is structural, not a parameter-count artifact.</p>
+
 <p>Final-step val loss, mean &plusmn; std across 5 seeds (lower is better):</p>
 
 <table>

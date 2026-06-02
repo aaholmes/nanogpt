@@ -144,7 +144,7 @@ def make_activation(name: str, init: str = "gelu_minimax"):
 
     For gated variants, returns the *inner* activation; the MLP class handles gating.
     """
-    if name in ("relu2",):
+    if name in ("relu2", "reglu"):
         return ReLU2()
     if name in ("gelu", "geglu"):
         return nn.GELU()
@@ -160,7 +160,7 @@ def make_activation(name: str, init: str = "gelu_minimax"):
 
 
 # Activations that use gated MLP (3 matmuls, hidden dim = round(8/3 * model_dim))
-GATED_ACTIVATIONS = {"swiglu", "geglu", "triglu", "xglu"}
+GATED_ACTIVATIONS = {"swiglu", "geglu", "triglu", "xglu", "reglu"}
 
 
 # -----------------------------------------------------------------------------
@@ -507,7 +507,7 @@ CONFIGS = {
 
 
 ALL_ACTIVATIONS = ["relu2", "gelu", "trilu_sym", "trilu_asym", "swiglu", "geglu", "triglu",
-                   "xabsx", "xglu"]
+                   "xabsx", "xglu", "reglu"]
 
 # Default 7-activation sweep covering the standard/gated x ReLU-like/GELU-like/TriLU comparison,
 # plus xglu (gated x|x|) which tests using the negative half of the input distribution.

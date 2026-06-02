@@ -22,6 +22,7 @@ COLORS = {
     "triglu": "#7a2d8c",
     "xabsx": "#3a7ac8",
     "xglu": "#d4af37",
+    "reglu": "#c0392b",
 }
 
 
