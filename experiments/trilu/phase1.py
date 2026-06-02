@@ -50,8 +50,29 @@ def _nullctx():
 # Activations
 
 class ReLU2(nn.Module):
+    """Squared ReLU, optionally shifted and given a nonzero initial slope:
+
+        f(x) = ReLU(x - t)**2 + s * ReLU(x - t)
+
+    s=0, t=0 recovers plain ReLU² (max(0,x)²), whose derivative 2x -> 0 as
+    x -> 0+, so small positive pre-activations are gradient-starved. s=1 puts a
+    slope-1 floor at the threshold (derivative 2(x-t)+s >= 1 in the active
+    region), fixing that without changing the cost. t shifts the activation
+    threshold right (larger t -> more sparsity; post-LayerNorm input is ~N(0,1),
+    so t=0 is ~50% dead, t=1 ~84% dead). Still transcendental-free and fusable.
+    """
+
+    def __init__(self, slope: float = 0.0, shift: float = 0.0):
+        super().__init__()
+        self.slope = slope
+        self.shift = shift
+
     def forward(self, x):
-        return F.relu(x).square()
+        z = F.relu(x - self.shift) if self.shift else F.relu(x)
+        out = z.square()
+        if self.slope:
+            out = out + self.slope * z
+        return out
 
 
 class XAbsX(nn.Module):
@@ -139,13 +160,15 @@ class TriLU(nn.Module):
         return out
 
 
-def make_activation(name: str, init: str = "gelu_minimax"):
+def make_activation(name: str, init: str = "gelu_minimax",
+                    act_slope: float = 0.0, act_shift: float = 0.0):
     """Factory that returns a fresh activation module each call.
 
     For gated variants, returns the *inner* activation; the MLP class handles gating.
+    act_slope / act_shift only affect the ReLU² family (relu2, reglu); ignored otherwise.
     """
     if name in ("relu2", "reglu"):
-        return ReLU2()
+        return ReLU2(slope=act_slope, shift=act_shift)
     if name in ("gelu", "geglu"):
         return nn.GELU()
     if name == "swiglu":
@@ -268,9 +291,10 @@ class GatedMLP(nn.Module):
 
 
 def make_mlp(dim: int, model_dim: int, act_name: str, act_init: str,
-             gate_pool: int = 1, gate_pool_type: str = "mean") -> nn.Module:
+             gate_pool: int = 1, gate_pool_type: str = "mean",
+             act_slope: float = 0.0, act_shift: float = 0.0) -> nn.Module:
     """Build an MLP block. Hidden dim chosen to match params: 4d for standard, (8/3)d for gated."""
-    act = make_activation(act_name, act_init)
+    act = make_activation(act_name, act_init, act_slope=act_slope, act_shift=act_shift)
     if act_name in GATED_ACTIVATIONS:
         # 8/3 * d, rounded to nearest multiple of 64 for hardware-friendliness
         hidden = max(64, round(8 * model_dim / 3 / 64) * 64)
@@ -282,13 +306,14 @@ def make_mlp(dim: int, model_dim: int, act_name: str, act_init: str,
 
 class Block(nn.Module):
     def __init__(self, dim, num_heads, model_dim, act_name, act_init,
-                 gate_pool=1, gate_pool_type="mean"):
+                 gate_pool=1, gate_pool_type="mean", act_slope=0.0, act_shift=0.0):
         super().__init__()
         self.ln1 = nn.LayerNorm(dim)
         self.attn = CausalSelfAttention(dim, num_heads)
         self.ln2 = nn.LayerNorm(dim)
         self.mlp = make_mlp(dim, model_dim, act_name, act_init,
-                            gate_pool=gate_pool, gate_pool_type=gate_pool_type)
+                            gate_pool=gate_pool, gate_pool_type=gate_pool_type,
+                            act_slope=act_slope, act_shift=act_shift)
 
     def forward(self, x):
         x = x + self.attn(self.ln1(x))
@@ -298,14 +323,15 @@ class Block(nn.Module):
 
 class TinyGPT(nn.Module):
     def __init__(self, vocab_size, num_layers, dim, num_heads, seq_len, act_name, act_init,
-                 gate_pool=1, gate_pool_type="mean"):
+                 gate_pool=1, gate_pool_type="mean", act_slope=0.0, act_shift=0.0):
         super().__init__()
         self.token_embed = nn.Embedding(vocab_size, dim)
         self.pos_embed = nn.Embedding(seq_len, dim)
         # one MLP per layer; gated variants get their own hidden dim sized to match params
         self.blocks = nn.ModuleList([
             Block(dim, num_heads, dim, act_name, act_init,
-                  gate_pool=gate_pool, gate_pool_type=gate_pool_type)
+                  gate_pool=gate_pool, gate_pool_type=gate_pool_type,
+                  act_slope=act_slope, act_shift=act_shift)
             for _ in range(num_layers)
         ])
         self.ln_f = nn.LayerNorm(dim)
@@ -454,6 +480,8 @@ def train_one(config, train_data, val_data, seed, device):
         act_init=config.get("init", "gelu_minimax"),
         gate_pool=config.get("gate_pool", 1),
         gate_pool_type=config.get("gate_pool_type", "mean"),
+        act_slope=config.get("act_slope", 0.0),
+        act_shift=config.get("act_shift", 0.0),
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
@@ -584,6 +612,12 @@ def main():
                          "1 = no pooling. Only affects gated activations.")
     ap.add_argument("--gate-pool-type", type=str, default="mean", choices=["mean", "max"],
                     help="pooling op for --gate-pool")
+    ap.add_argument("--act-slope", type=float, default=0.0,
+                    help="initial slope s of the ReLU² family: ReLU(x-t)²+s·ReLU(x-t). "
+                         "s=0 is plain ReLU²; s=1 gives a slope-1 floor. Affects relu2/reglu only.")
+    ap.add_argument("--act-shift", type=float, default=0.0,
+                    help="threshold shift t of the ReLU² family (larger t -> more sparsity). "
+                         "Affects relu2/reglu only.")
     args = ap.parse_args()
 
     if args.tiny:
@@ -596,6 +630,8 @@ def main():
         cfg_base["batch_size"] = args.batch_size
     cfg_base["gate_pool"] = args.gate_pool
     cfg_base["gate_pool_type"] = args.gate_pool_type
+    cfg_base["act_slope"] = args.act_slope
+    cfg_base["act_shift"] = args.act_shift
 
     device = pick_device(args.device)
     print(f"Device: {device}")
@@ -615,8 +651,12 @@ def main():
     all_results = {}
     for act in activations:
         cfg = dict(cfg_base, activation=act, init=args.init, freeze_trilu=args.freeze_trilu)
-        # Self-describing key so pooled runs don't collide with k=1 in the same file.
-        key = act if args.gate_pool == 1 else f"{act}_pool{args.gate_pool}{args.gate_pool_type[0]}"
+        # Self-describing key so pooled / shaped runs don't collide in the same file.
+        key = act
+        if args.gate_pool != 1:
+            key += f"_pool{args.gate_pool}{args.gate_pool_type[0]}"
+        if args.act_slope or args.act_shift:
+            key += f"_s{args.act_slope:g}t{args.act_shift:g}"
         all_results[key] = []
         for seed in range(args.seeds):
             print(f"\n=== activation={act}  gate_pool={args.gate_pool}  seed={seed} ===")
