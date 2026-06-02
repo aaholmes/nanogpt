@@ -76,7 +76,7 @@ class ReLU2(nn.Module):
 
 
 class XAbsX(nn.Module):
-    """f(x) = x * |x| = sign(x) * x²
+    """f(x) = x*|x| + s*x = sign(x)*x² + s*x
 
     Odd function (f(-x) = -f(x)). In a gated MLP with a linear gate, mean and skew
     of the output are automatically 0 (the gate's symmetry handles those, same as
@@ -84,9 +84,21 @@ class XAbsX(nn.Module):
     *negative* half of the input distribution rather than zeroing it out like
     ReLU/ReLU² do. E[(z|z|)²] = E[z⁴] = 3 for z ~ N(0,1), so the natural init
     scaling for the gate branch is Var[W₂x] = 1/3 if you want output variance 1.
+
+    Plain x|x| has derivative 2|x|, which is 0 at the origin (slow-start from both
+    sides). The slope term s gives derivative 2|x|+s, i.e. slope s at x=0, fixing
+    the gradient-starved flat spot while keeping the function odd. s=1 is the
+    two-sided analog of the sloped ReLU² (its positive branch x²+x matches exactly).
     """
+    def __init__(self, slope: float = 0.0):
+        super().__init__()
+        self.slope = slope
+
     def forward(self, x):
-        return x * x.abs()
+        out = x * x.abs()
+        if self.slope:
+            out = out + self.slope * x
+        return out
 
 
 def _inv_softplus(y: float) -> float:
@@ -165,7 +177,8 @@ def make_activation(name: str, init: str = "gelu_minimax",
     """Factory that returns a fresh activation module each call.
 
     For gated variants, returns the *inner* activation; the MLP class handles gating.
-    act_slope / act_shift only affect the ReLU² family (relu2, reglu); ignored otherwise.
+    act_slope affects the ReLU² family (relu2, reglu) and the x|x| family (xabsx, xglu);
+    act_shift affects the ReLU² family only.
     """
     if name in ("relu2", "reglu"):
         return ReLU2(slope=act_slope, shift=act_shift)
@@ -178,7 +191,7 @@ def make_activation(name: str, init: str = "gelu_minimax",
     if name in ("trilu_asym", "triglu"):
         return TriLU(asymmetric=True, init=init)
     if name in ("xabsx", "xglu"):
-        return XAbsX()
+        return XAbsX(slope=act_slope)
     raise ValueError(f"Unknown activation: {name}")
 
 
@@ -613,8 +626,9 @@ def main():
     ap.add_argument("--gate-pool-type", type=str, default="mean", choices=["mean", "max"],
                     help="pooling op for --gate-pool")
     ap.add_argument("--act-slope", type=float, default=0.0,
-                    help="initial slope s of the ReLU² family: ReLU(x-t)²+s·ReLU(x-t). "
-                         "s=0 is plain ReLU²; s=1 gives a slope-1 floor. Affects relu2/reglu only.")
+                    help="initial slope s at the origin. ReLU² family: ReLU(x-t)²+s·ReLU(x-t); "
+                         "x|x| family: x|x|+s·x. s=0 is the plain activation; s=1 gives slope 1 "
+                         "at x=0. Affects relu2/reglu and xabsx/xglu.")
     ap.add_argument("--act-shift", type=float, default=0.0,
                     help="threshold shift t of the ReLU² family (larger t -> more sparsity). "
                          "Affects relu2/reglu only.")
