@@ -71,6 +71,7 @@
   <li><a href="#landscape">Strategic Landscape: Track 1 vs Track 2</a></li>
   <li><a href="#ideas">Ideas Ranked by Leverage</a></li>
   <li><a href="#activation">Detailed Plan: TriLU Activation Function Experiment</a></li>
+  <li><a href="#phase1-results">Phase 1 Results (medium config, 5060 Ti)</a></li>
   <li><a href="#synthesis">Synthesis: Combined Optimization Potential &amp; Prioritization</a></li>
   <li><a href="#risks">Risks &amp; Open Questions</a></li>
 </ol>
@@ -759,7 +760,47 @@ This is the cleanest possible test of the hypothesis "GELU shape vs ReLU&sup2; s
 
 <p>If the bounded variant shows promise but doesn&rsquo;t quite clear the record, consider co-tuning the surrounding scaffolding (Tier C4 idea): re-evaluate init scales, logit softcap, FP8 quant scales <em>around</em> the new activation. The reason this hasn&rsquo;t worked for prior activation tweaks is precisely that the surrounding code is tuned for ReLU&sup2;&rsquo;s unboundedness. A bounded activation should let you tighten everything else.</p>
 
-<h2 id="synthesis">8. Synthesis: Combined Optimization Potential &amp; Prioritization</h2>
+<h2 id="phase1-results">8. Phase 1 Results (medium config, 5060 Ti)</h2>
+
+<p class="muted">Run 2026-06-02. 6 variants &times; 5 seeds &times; 3000 steps. Config: 8 layers, model_dim 512, 8 heads, seq_len 1024, batch 16, bf16 autocast, AdamW. Frozen TriLU/TriGLU (params fixed at minimax GELU-fit, 0 learnable activation params). Self-contained vanilla-PyTorch harness &mdash; <strong>no Muon / FP8 / FA3 / softcap / value embeddings</strong>; this measures activation/MLP-structure quality in isolation, not modded-nanogpt wallclock. Data: <code>experiments/trilu/results_overnight.json</code>; analysis: <code>experiments/trilu/significance.py</code>.</p>
+
+<p>Final-step val loss, mean &plusmn; std across 5 seeds (lower is better):</p>
+
+<table>
+<tr><th>Variant</th><th>MLP</th><th>Shape</th><th>Mean val</th><th>Std</th></tr>
+<tr><td><strong>geglu</strong></td><td>gated</td><td>GELU</td><td><strong>6.8901</strong></td><td>0.0505</td></tr>
+<tr><td>triglu</td><td>gated</td><td>TriLU (frozen)</td><td>6.8934</td><td>0.0533</td></tr>
+<tr><td>swiglu</td><td>gated</td><td>SiLU</td><td>6.8988</td><td>0.0489</td></tr>
+<tr><td>relu2</td><td>standard</td><td>ReLU&sup2; (baseline)</td><td>6.9342</td><td>0.0496</td></tr>
+<tr><td>gelu</td><td>standard</td><td>GELU</td><td>6.9955</td><td>0.0461</td></tr>
+<tr><td>trilu_asym</td><td>standard</td><td>TriLU (frozen)</td><td>7.0138</td><td>0.0469</td></tr>
+</table>
+
+<p>Significance via <strong>paired</strong> t-tests (pairing on seed index; all variants share each seed&rsquo;s init/data draw, so pairing removes the large correlated seed effect &mdash; t-stats run 16&ndash;28, far above what the raw std would suggest).</p>
+
+<div class="good">
+<strong>Finding 1 &mdash; gating wins decisively.</strong> Gated MLPs (geglu/triglu/swiglu, mean 6.894) beat standard MLPs (relu2/gelu/trilu, mean 6.981) by <strong>0.087 nats, p = 0.000012</strong>. Every gated variant beats every standard variant pairwise at p &lt; 0.01. This is the strongest signal in the sweep.
+</div>
+
+<div class="warn">
+<strong>Finding 2 &mdash; the primary TriLU hypothesis is refuted at this scale.</strong> Within the standard-MLP row the order is <strong>ReLU&sup2; &lt; GELU &lt; frozen TriLU</strong>, all pairwise significant (p &lt; 0.01). The GELU-shaped activation is the <em>worst</em> standard variant, and ReLU&sup2; beats GELU by 0.061 nats. So ReLU&sup2; did <em>not</em> win this codebase merely on cost &mdash; at medium scale, in this scaffold, it wins on shape too. The hypothesis &ldquo;GELU shape beats ReLU&sup2; shape at near-equal cost&rdquo; does not hold here.
+</div>
+
+<p><strong>Finding 3 &mdash; inside the gated structure, activation shape barely matters.</strong> geglu &asymp; triglu &asymp; swiglu: geglu vs triglu is not significant (p = 0.21), geglu vs swiglu is marginal (p = 0.03, not significant at the p &lt; 0.01 bar). The frozen TriLU adds nothing over GELU inside a gated MLP &mdash; consistent with TriLU being a GELU stand-in by construction. The gating structure, not the pointwise shape, is doing the work.</p>
+
+<p><strong>Trajectory plot caveat.</strong> TriLU/TriGLU ran <em>frozen</em> (<code>--freeze-trilu</code>), so the <code>(L, R, &alpha;)</code> trajectory plot is flat by construction and carries no information this run. The &ldquo;does the network want to drift from GELU?&rdquo; question requires a follow-up learnable-TriLU run.</p>
+
+<p>Plots: <code>experiments/trilu/val_loss.png</code> (val loss vs step, mean &plusmn; std band), <code>dead_zones.png</code> (dead-fraction over training), <code>trilu_trajectories.png</code> (flat &mdash; frozen run).</p>
+
+<h3>Implications for strategy</h3>
+<ul>
+  <li><strong>Demote A1 (TriLU as the activation).</strong> The clean-shape-test motivation is gone: frozen TriLU is the worst standard variant. A learnable-TriLU run is still worth doing as a secondary test (does drift help?), but the &ldquo;ReLU&sup2; won on cost not shape&rdquo; thesis is dead at this scale. Do <em>not</em> spend H100 budget on frozen-TriLU Track-1 validation.</li>
+  <li><strong>Promote B1 (fused gated-MLP kernel).</strong> Gating is the real, large, significant effect. The natural Phase 2 pivot &mdash; flagged conditionally in the original plan &mdash; is now the main line: build a fused gated-MLP and co-tune it against the full modded-nanogpt stack in Phase 1.5.</li>
+  <li><strong>B5 / C7 dependency conditions are met.</strong> Both were gated on &ldquo;Phase 1 establishing gated MLPs as viable.&rdquo; They are now live: 4-bit gated-W&#8322; quantization (B5) and SE-style compressed gate input (C7) become candidate follow-ons <em>if</em> the gated kernel survives Phase 1.5.</li>
+  <li><strong>The scale/scaffold caveat still binds.</strong> No Muon / FP8 / softcap here. Gating&rsquo;s 0.087-nat win must be re-confirmed inside <code>train_gpt.py</code> on a single H100 before any record attempt &mdash; Muon&rsquo;s spectral-norm bias and the param-count rebalance ((8/3)d vs 4d hidden) interact with gating in ways this harness can&rsquo;t see.</li>
+</ul>
+
+<h2 id="synthesis">9. Synthesis: Combined Optimization Potential &amp; Prioritization</h2>
 
 <p>This section ties the individual ideas together into a coherent multi-month plan and addresses the question: <em>what should we work on first?</em></p>
 
@@ -896,7 +937,7 @@ This is the cleanest possible test of the hypothesis "GELU shape vs ReLU&sup2; s
 
 <p>This is why the realistic expected values above are below the naive "FLOPs / bandwidth saved" numbers &mdash; some of the saving gets re-invested in extra steps to maintain the buffer position.</p>
 
-<h2 id="risks">9. Risks &amp; Open Questions</h2>
+<h2 id="risks">10. Risks &amp; Open Questions</h2>
 
 <h3>Risks</h3>
 
