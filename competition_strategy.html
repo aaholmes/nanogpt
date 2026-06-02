@@ -766,17 +766,19 @@ This is the cleanest possible test of the hypothesis "GELU shape vs ReLU&sup2; s
 
 <p><strong>Parameter counts:</strong> standard MLPs (relu2/gelu/trilu) = 51.46M; gated MLPs (geglu/swiglu/triglu) = 51.20M. The gated variants carry ~262K <em>fewer</em> params (gated hidden dim rounds to 1344, a multiple of 64, vs the 4d=2048 standard hidden). So gating wins <em>despite</em> a slight parameter disadvantage &mdash; the effect is structural, not a parameter-count artifact.</p>
 
-<p>Final-step val loss, mean &plusmn; std across 5 seeds (lower is better):</p>
+<p>Final-step val loss, mean &plusmn; std across 5 seeds (lower is better). All seven variants on the same seed indices, so every pairwise comparison is paired. The <code>reglu</code> row (ReLU&sup2;-gate) is the cheap-gate follow-up &mdash; see Finding 4 below for its motivation and the paired stats.</p>
 
 <table>
 <tr><th>Variant</th><th>MLP</th><th>Shape</th><th>Mean val</th><th>Std</th></tr>
-<tr><td><strong>geglu</strong></td><td>gated</td><td>GELU</td><td><strong>6.8901</strong></td><td>0.0505</td></tr>
+<tr><td><strong>reglu</strong></td><td>gated</td><td>ReLU&sup2; (cheap, fusable)</td><td><strong>6.8487</strong></td><td>0.0485</td></tr>
+<tr><td>geglu</td><td>gated</td><td>GELU</td><td>6.8901</td><td>0.0505</td></tr>
 <tr><td>triglu</td><td>gated</td><td>TriLU (frozen)</td><td>6.8934</td><td>0.0533</td></tr>
 <tr><td>swiglu</td><td>gated</td><td>SiLU</td><td>6.8988</td><td>0.0489</td></tr>
 <tr><td>relu2</td><td>standard</td><td>ReLU&sup2; (baseline)</td><td>6.9342</td><td>0.0496</td></tr>
 <tr><td>gelu</td><td>standard</td><td>GELU</td><td>6.9955</td><td>0.0461</td></tr>
 <tr><td>trilu_asym</td><td>standard</td><td>TriLU (frozen)</td><td>7.0138</td><td>0.0469</td></tr>
 </table>
+<p class="muted"><code>xglu</code> (gated <em>x|x|</em>, the second cheap gate) is still running; its row will be added when the run completes.</p>
 
 <p>Significance via <strong>paired</strong> t-tests (pairing on seed index; all variants share each seed&rsquo;s init/data draw, so pairing removes the large correlated seed effect &mdash; t-stats run 16&ndash;28, far above what the raw std would suggest).</p>
 
@@ -794,18 +796,10 @@ This is the cleanest possible test of the hypothesis "GELU shape vs ReLU&sup2; s
 
 <h3>Cheap-gate follow-up: ReLU&sup2;-gate (reglu)</h3>
 
-<p class="muted">Finding 3 says shape barely matters <em>within the smooth-gate family</em> (GELU/SiLU-like). That motivated testing a qualitatively different, kernel-friendly gate: <strong>reglu</strong> = ReLU&sup2; on the activation branch of a gated MLP (transcendental-free, fusable, reuses the record&nbsp;#59 fused-ReLU&sup2; kernel). Same medium config, 5 seeds, same seed indices as the main sweep (so the comparison is paired). Data: <code>experiments/trilu/results_cheapgate.json</code>. (<code>xglu</code> = gated <em>x|x|</em> is queued in the same run as a second cheap gate; result pending.)</p>
-
-<table>
-<tr><th>Gated variant</th><th>Gate shape</th><th>Mean val</th><th>reglu &minus; it (paired, n=5)</th><th>p</th></tr>
-<tr><td><strong>reglu</strong></td><td>ReLU&sup2; (cheap, fusable)</td><td><strong>6.8487</strong> &plusmn; 0.0485</td><td>&mdash;</td><td>&mdash;</td></tr>
-<tr><td>geglu</td><td>GELU</td><td>6.8901</td><td>&minus;0.0414</td><td>0.00004</td></tr>
-<tr><td>triglu</td><td>TriLU (frozen)</td><td>6.8934</td><td>&minus;0.0447</td><td>0.00007</td></tr>
-<tr><td>swiglu</td><td>SiLU</td><td>6.8988</td><td>&minus;0.0501</td><td>&lt;0.00001</td></tr>
-</table>
+<p class="muted">Finding 3 says shape barely matters <em>within the smooth-gate family</em> (GELU/SiLU-like). That motivated testing a qualitatively different, kernel-friendly gate: <strong>reglu</strong> = ReLU&sup2; on the activation branch of a gated MLP (transcendental-free, fusable, reuses the record&nbsp;#59 fused-ReLU&sup2; kernel). Same medium config, 5 seeds, same seed indices as the main sweep (so the comparison is paired). It is included as the top row of the table above. Data: <code>experiments/trilu/results_cheapgate.json</code>.</p>
 
 <div class="good">
-<strong>Finding 4 &mdash; the cheapest gate is also the best.</strong> reglu beats every smooth-gate variant by ~0.041&ndash;0.050 nats, paired p &lt; 0.0001, winning on essentially every seed. So &ldquo;shape barely matters&rdquo; held only <em>within</em> the smooth-gate family; the sparse / non-negative ReLU&sup2; shape breaks out of the cluster. This mirrors the standard-MLP row, where ReLU&sup2; also won &mdash; a single coherent story: <strong>ReLU&sup2;&rsquo;s sparsity + non-negativity helps in both the standard and the gated MLP.</strong> Strategically near-best-case: the activation that is cheapest to fuse (no transcendentals, existing kernel) is also the most accurate, so the gated-MLP kernel target is now concrete &mdash; a ReLU&sup2;-gate.
+<strong>Finding 4 &mdash; the cheapest gate is also the best.</strong> reglu (6.8487) beats every smooth-gate variant on a paired basis: vs geglu &minus;0.0414 (p=0.00004), vs triglu &minus;0.0447 (p=0.00007), vs swiglu &minus;0.0501 (p&lt;0.00001) &mdash; winning on essentially every seed. So &ldquo;shape barely matters&rdquo; held only <em>within</em> the smooth-gate family; the sparse / non-negative ReLU&sup2; shape breaks out of the cluster. This mirrors the standard-MLP row, where ReLU&sup2; also won &mdash; a single coherent story: <strong>ReLU&sup2;&rsquo;s sparsity + non-negativity helps in both the standard and the gated MLP.</strong> Strategically near-best-case: the activation that is cheapest to fuse (no transcendentals, existing kernel) is also the most accurate, so the gated-MLP kernel target is now concrete &mdash; a ReLU&sup2;-gate.
 </div>
 
 <p><strong>Caveat (init fairness).</strong> All variants use the shared default <code>nn.Linear</code> init, which is not each activation&rsquo;s variance-optimal init &mdash; so this is a fair <em>drop-in</em> comparison, not yet a pure <em>shape</em> comparison. LayerNorm launders much of the mismatch, and ReLU&sup2; is arguably the activation the generic init suits <em>least</em> (no closed-form init), so its win is hard to dismiss as init-luck. A small init-gain sweep (reglu vs xglu at 2&ndash;3 init scales) is the clean way to separate shape from init before claiming the mechanistic result; queued as a follow-up.</p>
