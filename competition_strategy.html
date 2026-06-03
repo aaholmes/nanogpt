@@ -850,7 +850,11 @@ Clean decomposition: <strong>gate-type penalty (bounded vs linear) = +0.086</str
 </table>
 
 <div class="warn">
-<strong>The AdamW gating win was largely an optimizer artifact.</strong> Under AdamW, gating beat the standard MLP by ~0.087 and reglu&asymp;xglu. Under Muon the best gated variant (xglu) only <em>ties</em> standard ReLU&sup2;, and reglu <em>collapses</em>. Since a gated MLP costs more (3 matmuls vs 2), a tie is a net loss on wallclock &mdash; so <strong>the gated-MLP record direction is not supported by Muon</strong>, and we should not spend rented-H100 budget on it. This is the Gate-2 test doing its job: it killed the direction for ~$0. (A refined run with parabola-fit per-variant LRs + bilinear is in progress to confirm the tie isn't LR-mistuning; preliminary refined relu2 &asymp; 6.178.)
+<strong>The AdamW gating win was largely an optimizer artifact.</strong> Under AdamW, gating beat the standard MLP by ~0.087 and reglu&asymp;xglu. Under Muon the best gated variant (xglu) only <em>ties</em> standard ReLU&sup2;, and reglu <em>collapses</em>. Since a gated MLP costs more (3 matmuls vs 2), a tie is a net loss on wallclock &mdash; so <strong>the gated-MLP record direction is not supported by Muon</strong>, and we should not spend rented-H100 budget on it. This is the Gate-2 test doing its job: it killed the direction for ~$0.
+</div>
+
+<div class="warn">
+<strong>Correction (in progress) &mdash; the reglu "collapse" was largely an LR artifact.</strong> The +0.18 reglu result above used a coarse LR (0.02). Re-running with the parabola-fit per-variant LR (reglu &rarr; 0.0134), everything else identical, the gap shrinks to <strong>+0.021 and is no longer significant (p=0.46, n=2 so far)</strong>: reglu &asymp; relu2, not a collapse. So Finding 8&rsquo;s strong form is overstated &mdash; the dramatic collapse was mostly mis-tuning (LR tuning alone moved the result 0.16 nats, vindicating the push for per-variant parabola LR search). The robust claim survives: under Muon, gating does <em>not</em> clearly <em>beat</em> standard ReLU&sup2; (best case a tie), so the gated direction still isn&rsquo;t record-worthy &mdash; but it doesn&rsquo;t catastrophically fail either. The <strong>faithful study now running</strong> (124M = nanogpt-small scale, Polar Express orthogonalizer, compile + chunked-CE, proper per-variant LRs, 4 seeds) re-establishes all of this cleanly; these medium/Newton-Schulz numbers are superseded pilot data.
 </div>
 
 <h4>Why the optimizer reorders the ranking</h4>
