@@ -321,8 +321,9 @@ class GatedMLP(nn.Module):
 
     def __init__(self, dim: int, mlp_dim: int, activation: nn.Module,
                  gate_pool: int = 1, gate_pool_type: str = "mean", gate_act: str = "linear",
-                 gate_zero_init: bool = False):
+                 gate_zero_init: bool = False, dual_act: bool = False):
         super().__init__()
+        self.dual_act = dual_act
         self.fc1 = nn.Linear(dim, mlp_dim, bias=False)
         if gate_pool > 1:
             self.gate_pool = ChannelPool(dim, gate_pool, gate_pool_type)
@@ -345,7 +346,12 @@ class GatedMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_in = self.gate_pool(x) if self.gate_pool is not None else x
-        gate = apply_gate_act(self.fc_gate(gate_in), self.gate_act)
+        g = self.fc_gate(gate_in)
+        # dual_act: apply the SAME value activation to the gate branch too -- e.g.
+        # double-QuadLU = QuadLU(W1 x) * QuadLU(W2 x). Symmetric in the two branches, so
+        # the quadratic is available on whichever branch specializes as the value (tests
+        # the role/arbitrariness hypothesis vs xglu's one-fixed-branch quadratic).
+        gate = self.act(g) if self.dual_act else apply_gate_act(g, self.gate_act)
         h = self.act(self.fc1(x)) * gate
         if self._capture_dead:
             with torch.no_grad():
@@ -356,14 +362,14 @@ class GatedMLP(nn.Module):
 def make_mlp(dim: int, model_dim: int, act_name: str, act_init: str,
              gate_pool: int = 1, gate_pool_type: str = "mean",
              act_slope: float = 0.0, act_shift: float = 0.0, act_curv: float = 1.0,
-             gate_act: str = "linear", gate_zero_init: bool = False) -> nn.Module:
+             gate_act: str = "linear", gate_zero_init: bool = False, dual_act: bool = False) -> nn.Module:
     """Build an MLP block. Hidden dim chosen to match params: 4d for standard, (8/3)d for gated."""
     act = make_activation(act_name, act_init, act_slope=act_slope, act_shift=act_shift, act_curv=act_curv)
     if act_name in GATED_ACTIVATIONS:
         # 8/3 * d, rounded to nearest multiple of 64 for hardware-friendliness
         hidden = max(64, round(8 * model_dim / 3 / 64) * 64)
         return GatedMLP(dim, hidden, act, gate_pool=gate_pool, gate_pool_type=gate_pool_type,
-                        gate_act=gate_act, gate_zero_init=gate_zero_init)
+                        gate_act=gate_act, gate_zero_init=gate_zero_init, dual_act=dual_act)
     else:
         hidden = 4 * model_dim
         return MLP(dim, hidden, act)
@@ -372,7 +378,7 @@ def make_mlp(dim: int, model_dim: int, act_name: str, act_init: str,
 class Block(nn.Module):
     def __init__(self, dim, num_heads, model_dim, act_name, act_init,
                  gate_pool=1, gate_pool_type="mean", act_slope=0.0, act_shift=0.0, act_curv=1.0,
-                 gate_act="linear", gate_zero_init=False):
+                 gate_act="linear", gate_zero_init=False, dual_act=False):
         super().__init__()
         self.ln1 = nn.LayerNorm(dim)
         self.attn = CausalSelfAttention(dim, num_heads)
@@ -380,7 +386,7 @@ class Block(nn.Module):
         self.mlp = make_mlp(dim, model_dim, act_name, act_init,
                             gate_pool=gate_pool, gate_pool_type=gate_pool_type,
                             act_slope=act_slope, act_shift=act_shift, act_curv=act_curv,
-                            gate_act=gate_act, gate_zero_init=gate_zero_init)
+                            gate_act=gate_act, gate_zero_init=gate_zero_init, dual_act=dual_act)
 
     def forward(self, x):
         x = x + self.attn(self.ln1(x))
@@ -391,7 +397,7 @@ class Block(nn.Module):
 class TinyGPT(nn.Module):
     def __init__(self, vocab_size, num_layers, dim, num_heads, seq_len, act_name, act_init,
                  gate_pool=1, gate_pool_type="mean", act_slope=0.0, act_shift=0.0, act_curv=1.0,
-                 gate_act="linear", gate_zero_init=False):
+                 gate_act="linear", gate_zero_init=False, dual_act=False):
         super().__init__()
         self.token_embed = nn.Embedding(vocab_size, dim)
         self.pos_embed = nn.Embedding(seq_len, dim)
@@ -400,7 +406,7 @@ class TinyGPT(nn.Module):
             Block(dim, num_heads, dim, act_name, act_init,
                   gate_pool=gate_pool, gate_pool_type=gate_pool_type,
                   act_slope=act_slope, act_shift=act_shift, act_curv=act_curv,
-                  gate_act=gate_act, gate_zero_init=gate_zero_init)
+                  gate_act=gate_act, gate_zero_init=gate_zero_init, dual_act=dual_act)
             for _ in range(num_layers)
         ])
         self.ln_f = nn.LayerNorm(dim)
@@ -647,6 +653,7 @@ def train_one(config, train_data, val_data, seed, device):
         act_curv=config.get("act_curv", 1.0),
         gate_act=config.get("gate_act", "linear"),
         gate_zero_init=config.get("gate_zero_init", False),
+        dual_act=config.get("dual_act", False),
         act_shift=config.get("act_shift", 0.0),
     ).to(device)
 
@@ -795,6 +802,9 @@ def main():
                     help="nonlinearity on the gate branch of a gated MLP. linear = standard "
                          "SwiGLU signed/unbounded gate; fast_sigmoid = cheap rational 0-1 valve "
                          "(0.5*g/(1+|g|)+0.5); sigmoid = true 0-1 valve. Only affects gated activations.")
+    ap.add_argument("--dual-act", action="store_true",
+                    help="apply the value activation to the gate branch too (e.g. double-QuadLU = "
+                         "QuadLU(W1 x)*QuadLU(W2 x)). Symmetric; quadratic available on both branches. Gated only.")
     ap.add_argument("--gate-zero-init", action="store_true",
                     help="zero-init the gate matrix. With a bounded gate this starts every valve "
                          "at 0.5 (max-derivative, agnostic), learning its direction from there; "
@@ -822,6 +832,7 @@ def main():
     cfg_base["act_curv"] = args.act_curv
     cfg_base["gate_act"] = args.gate_act
     cfg_base["gate_zero_init"] = args.gate_zero_init
+    cfg_base["dual_act"] = args.dual_act
     cfg_base["optimizer"] = args.optimizer
     cfg_base["muon_lr"] = args.muon_lr
     cfg_base["target_loss"] = args.target_loss
@@ -856,6 +867,8 @@ def main():
             key += f"_g{args.gate_act}"
         if args.gate_zero_init:
             key += "_zg"
+        if args.dual_act:
+            key += "_dual"
         if args.optimizer != "adamw":
             key += f"_{args.optimizer}"
         all_results[key] = []
