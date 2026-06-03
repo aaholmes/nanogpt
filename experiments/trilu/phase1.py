@@ -394,6 +394,22 @@ class Block(nn.Module):
         return x
 
 
+def _ce_chunk(a, w, b):
+    return F.cross_entropy(F.linear(a, w), b, reduction="sum")
+
+
+def chunked_cross_entropy(x, weight, targets, chunk):
+    """Mean cross-entropy over tokens, computed in chunks so the full (N, vocab) logits
+    tensor is never held at once. Each chunk's logits are recomputed in backward
+    (checkpoint), so peak logits memory ~ (chunk, vocab) instead of (N, vocab)."""
+    n = x.size(0)
+    total = x.new_zeros(())
+    for i in range(0, n, chunk):
+        total = total + torch.utils.checkpoint.checkpoint(
+            _ce_chunk, x[i:i + chunk], weight, targets[i:i + chunk], use_reentrant=False)
+    return total / n
+
+
 class TinyGPT(nn.Module):
     def __init__(self, vocab_size, num_layers, dim, num_heads, seq_len, act_name, act_init,
                  gate_pool=1, gate_pool_type="mean", act_slope=0.0, act_shift=0.0, act_curv=1.0,
@@ -414,6 +430,7 @@ class TinyGPT(nn.Module):
         # Tie embedding and output weights (standard for small GPTs).
         self.head.weight = self.token_embed.weight
         self.seq_len = seq_len
+        self.ce_chunk = 0  # 0 = materialize full logits; >0 = chunked CE (memory saver)
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
@@ -422,9 +439,16 @@ class TinyGPT(nn.Module):
         for block in self.blocks:
             x = block(x)
         x = self.ln_f(x)
-        logits = self.head(x)
         if targets is None:
-            return logits, None
+            return self.head(x), None
+        if self.ce_chunk and self.ce_chunk > 0:
+            # Chunked cross-entropy: never materialize the full (B*T, vocab) logits tensor
+            # (the memory bottleneck that caps batch size). Each chunk's logits are
+            # recomputed in backward via checkpointing, so peak memory ~ one chunk.
+            loss = chunked_cross_entropy(x.reshape(-1, x.size(-1)), self.head.weight,
+                                         targets.reshape(-1), self.ce_chunk)
+            return None, loss
+        logits = self.head(x)
         loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
         return logits, loss
 
@@ -656,9 +680,16 @@ def train_one(config, train_data, val_data, seed, device):
         dual_act=config.get("dual_act", False),
         act_shift=config.get("act_shift", 0.0),
     ).to(device)
+    model.ce_chunk = config.get("ce_chunk", 0)
+    # Compiled view for the train/eval forward (big speedup via kernel fusion); the
+    # eager `model` is used for dead-zone capture (its in-forward .item() would force
+    # recompiles) and shares parameters with the compiled view.
+    cmodel = torch.compile(model) if config.get("compile") else model
 
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"  params: {n_params:,}  optimizer={config.get('optimizer','adamw')}")
+    print(f"  params: {n_params:,}  optimizer={config.get('optimizer','adamw')}"
+          f"{'  compile' if config.get('compile') else ''}"
+          f"{f'  ce_chunk={model.ce_chunk}' if model.ce_chunk else ''}")
 
     freeze_trilu = config.get("freeze_trilu", False)
     optimizers = build_optimizers(model, config)
@@ -680,7 +711,7 @@ def train_one(config, train_data, val_data, seed, device):
         x, y = batch[:, :-1], batch[:, 1:]
         amp_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16) if device == "cuda" else _nullctx()
         with amp_ctx:
-            _, loss = model(x, y)
+            _, loss = cmodel(x, y)
 
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
@@ -690,7 +721,7 @@ def train_one(config, train_data, val_data, seed, device):
             opt.step()
 
         if step % config["eval_every"] == 0 or step == total_steps - 1:
-            val_loss = evaluate(model, val_data, config["batch_size"], config["seq_len"], device, gen_val)
+            val_loss = evaluate(cmodel, val_data, config["batch_size"], config["seq_len"], device, gen_val)
             dead = measure_dead_zones(model, val_data, config["batch_size"], config["seq_len"], device, gen_val)
             mean_dead = sum(f for _, f in dead) / max(len(dead), 1)
             elapsed = time.time() - t0
@@ -746,6 +777,15 @@ CONFIGS = {
         num_layers=8, dim=512, num_heads=8,
         seq_len=1024, batch_size=32,
         total_steps=3000, warmup=200, eval_every=100,
+        lr=3e-4, vocab_size=50304,
+    ),
+    "small": dict(  # matches the modded-nanogpt small-track architecture (~124M):
+                    # 12 layers, model_dim 768, 6 heads (head_dim 128). Removes the
+                    # scale confound for the activation-under-Muon study. Use with
+                    # --compile and --ce-chunk; tune --batch-size to fit 16 GB.
+        num_layers=12, dim=768, num_heads=6,
+        seq_len=1024, batch_size=16,
+        total_steps=4000, warmup=256, eval_every=100,
         lr=3e-4, vocab_size=50304,
     ),
 }
@@ -815,6 +855,12 @@ def main():
     ap.add_argument("--muon-lr", type=float, default=0.02, help="base LR for the Muon group.")
     ap.add_argument("--target-loss", type=float, default=None,
                     help="if set, log steps-to-reach this val loss (benchmark-aligned metric).")
+    ap.add_argument("--compile", action="store_true",
+                    help="torch.compile the train/eval forward (kernel fusion; big speedup, "
+                         "one-time compile cost). Dead-zone capture stays eager.")
+    ap.add_argument("--ce-chunk", type=int, default=0,
+                    help="chunked cross-entropy chunk size (tokens). 0 = full logits. >0 avoids "
+                         "materializing the (B*T, vocab) logits tensor, freeing memory for bigger batch.")
     args = ap.parse_args()
 
     if args.tiny:
@@ -833,6 +879,8 @@ def main():
     cfg_base["gate_act"] = args.gate_act
     cfg_base["gate_zero_init"] = args.gate_zero_init
     cfg_base["dual_act"] = args.dual_act
+    cfg_base["compile"] = args.compile
+    cfg_base["ce_chunk"] = args.ce_chunk
     cfg_base["optimizer"] = args.optimizer
     cfg_base["muon_lr"] = args.muon_lr
     cfg_base["target_loss"] = args.target_loss
