@@ -95,6 +95,8 @@ class XAbsX(nn.Module):
     The curvature c scales the x|x| term: f(x) = c*x|x| + s*x. With s=1, gating
     (half the outputs zeroed) and c=0.253, a standard-normal input gives unit-variance
     output (the variance-preserving, slope-1, monotonic member of the family).
+
+    With s=1 this family (x + c*x|x|) is "QuadLU" -- the value branch of QuadGLU.
     """
     def __init__(self, slope: float = 0.0, curv: float = 1.0):
         super().__init__()
@@ -286,10 +288,10 @@ def apply_gate_act(g: torch.Tensor, mode: str) -> torch.Tensor:
                                                 gentle polynomial-tail saturation)
     sigmoid       : 1/(1+e^-g)                 (true 0-1 valve; transcendental)
 
-    The bounded gates implement the "transistor" division of labor: the gate decides
-    *whether* a unit is on (0-1), the value branch decides the output *when* on. The
-    linear gate (the modern SwiGLU default) instead lets the gate also amplify and
-    flip sign -- which is why it tends to win.
+    The bounded gates implement the QuadGLU "division of labor" (transistor intuition):
+    the gate decides *whether* a unit is on (0-1), the value branch (QuadLU = x+c*x|x|)
+    decides the output *when* on. The linear gate (the modern SwiGLU default) instead
+    lets the gate also amplify and flip sign -- which is why it tends to win.
     """
     if mode == "fast_sigmoid":
         return 0.5 * g / (1.0 + g.abs()) + 0.5
@@ -309,7 +311,8 @@ class GatedMLP(nn.Module):
 
     gate_act applies a nonlinearity to the gate branch: 'linear' (default) is the
     standard SwiGLU signed/unbounded gate; 'fast_sigmoid'/'sigmoid' make it a
-    bounded 0-1 'whether-on' valve (the transistor-style division of labor).
+    bounded 0-1 'whether-on' valve. Paired with a QuadLU (x+c*x|x|) value branch,
+    the bounded-gate form is "QuadGLU with a valve gate" (transistor intuition).
     """
 
     def __init__(self, dim: int, mlp_dim: int, activation: nn.Module,
