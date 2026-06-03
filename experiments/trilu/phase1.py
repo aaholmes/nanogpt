@@ -527,17 +527,33 @@ def lr_mult(step, total_steps, warmup, min_frac=0.1):
 # because Muon "makes activation scale non-absorbable" -- so an activation/gate win
 # under AdamW must be re-confirmed under Muon before it means anything for the record.
 
+# Newton-Schulz uses a single fixed quintic; Polar Express (the real modded-nanogpt
+# orthogonalizer, arXiv 2505.16932) uses a per-step coefficient schedule that converges
+# to the orthogonal factor faster. Porting it closes the most mechanism-relevant gap
+# (our conclusions hinge on the orthogonalizer); the math is hardware-agnostic.
+_POLAR_EXPRESS_COEFFS = [
+    (8.156554524902461, -22.48329292557795, 15.878769915207462),
+    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
+    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
+    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
+    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
+]
+_NEWTON_SCHULZ_COEFFS = [(3.4445, -4.7750, 2.0315)] * 5
+
+
 @torch.no_grad()
-def zeropower_via_newtonschulz5(G, steps=5):
-    """Orthogonalize G (2D) via the quintic Newton-Schulz iteration (Keller Jordan)."""
+def orthogonalize(G, method="polar_express"):
+    """Orthogonalize G (2D) via a quintic iteration. method='polar_express' uses the
+    real modded-nanogpt coefficient schedule; 'newton_schulz' the classic fixed quintic."""
     assert G.ndim == 2
-    a, b, c = 3.4445, -4.7750, 2.0315
+    coeffs = _POLAR_EXPRESS_COEFFS if method == "polar_express" else _NEWTON_SCHULZ_COEFFS
     X = G.bfloat16()
     transpose = G.size(0) > G.size(1)
     if transpose:
         X = X.T
-    X = X / (X.norm() + 1e-7)
-    for _ in range(steps):
+    # spectral-norm safety factor (matches the real code's 1+2e-2)
+    X = X / (X.norm() * (1 + 2e-2) + 1e-7)
+    for a, b, c in coeffs:
         A = X @ X.T
         B = b * A + c * (A @ A)
         X = a * X + B @ X
@@ -547,8 +563,8 @@ def zeropower_via_newtonschulz5(G, steps=5):
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5):
-        super().__init__(params, dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps))
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ortho="polar_express"):
+        super().__init__(params, dict(lr=lr, momentum=momentum, nesterov=nesterov, ortho=ortho))
 
     @torch.no_grad()
     def step(self):
@@ -564,7 +580,7 @@ class Muon(torch.optim.Optimizer):
                 buf = state["momentum_buffer"]
                 buf.mul_(momentum).add_(g)
                 g = g.add(buf, alpha=momentum) if group["nesterov"] else buf
-                g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
+                g = orthogonalize(g, method=group["ortho"])
                 # shape-aware scale so the RMS update is comparable across matrices
                 p.add_(g, alpha=-lr * max(1.0, p.size(0) / p.size(1)) ** 0.5)
 
@@ -599,7 +615,8 @@ def build_optimizers(model, config):
     opts = []
     if config.get("optimizer", "adamw") == "muon":
         mlr = config.get("muon_lr", 0.02)
-        opts.append(Muon([{"params": body, "base_lr": mlr, "lr": mlr}], lr=mlr))
+        opts.append(Muon([{"params": body, "base_lr": mlr, "lr": mlr}], lr=mlr,
+                         ortho=config.get("muon_ortho", "polar_express")))
         add_adam(other, lr)
     else:
         add_adam(body + other, lr)
@@ -853,6 +870,10 @@ def main():
                     help="adamw (default) or muon (Newton-Schulz-orthogonalized momentum on the "
                          "hidden matrices, AdamW on embeddings/norms) -- the real modded-nanogpt optimizer.")
     ap.add_argument("--muon-lr", type=float, default=0.02, help="base LR for the Muon group.")
+    ap.add_argument("--muon-ortho", type=str, default="polar_express",
+                    choices=["polar_express", "newton_schulz"],
+                    help="orthogonalizer for Muon. polar_express = the real modded-nanogpt schedule "
+                         "(default); newton_schulz = classic fixed quintic (what the earlier runs used).")
     ap.add_argument("--target-loss", type=float, default=None,
                     help="if set, log steps-to-reach this val loss (benchmark-aligned metric).")
     ap.add_argument("--compile", action="store_true",
@@ -883,6 +904,7 @@ def main():
     cfg_base["ce_chunk"] = args.ce_chunk
     cfg_base["optimizer"] = args.optimizer
     cfg_base["muon_lr"] = args.muon_lr
+    cfg_base["muon_ortho"] = args.muon_ortho
     cfg_base["target_loss"] = args.target_loss
 
     device = pick_device(args.device)
