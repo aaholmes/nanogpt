@@ -826,12 +826,18 @@ This is the cleanest possible test of the hypothesis "GELU shape vs ReLU&sup2; s
 <div class="good">
 <strong>Finding 6 &mdash; the slope floor helps, monotonically, and reshuffles the top.</strong> reglu improves cleanly with slope: <strong>6.8487 (s=0) &rarr; 6.8328 (s=0.5) &rarr; 6.8202 (s=1)</strong>. Fixing ReLU&sup2;&rsquo;s gradient-starved slow-start at the origin is a real, monotone win. Adding the same slope floor to x|x| gives <strong>xglu s=1 = QuadLU (x+x|x|) = 6.8076, the overall best</strong> &mdash; it edges reglu s=1 (6.8202) by 0.0126, but only at <strong>p=0.05</strong> (not significant at 0.01): with both gates given the slope floor, the negative half (x|x| vs ReLU&sup2;) is a near-tie. Conversely, adding sparsity via the threshold shift (t=0.5) <em>hurts</em> (6.8531): slope good, extra sparsity bad. The kernel target is a slope-1 square-law gate &mdash; QuadLU (x+x|x|) or, near-equivalently, ReLU(x)+ReLU(x)².</div>
 
-<p><strong>Still running (trimmed plan):</strong></p>
-<ul>
-  <li><strong><code>reglu</code> s=1, c=0.253</strong> = ReLU(x)+0.253&middot;ReLU(x)&sup2; &mdash; the half-zeroed variance-preserving control. <em>Running.</em></li>
-  <li><strong>Decisive valve cell</strong>: the as-designed bounded-gate QuadGLU &mdash; fast_sigmoid gate, c=0.505 (variance-preserving), zero-init (valve at max-derivative 0.5). Its best shot vs the linear-gate baseline (xglu s=1, 6.8076). <em>Queued next.</em></li>
-</ul>
-<p class="muted">The rest of the bounded-gate 2&times;2 (c=1 cells, default-init cells, true-sigmoid control) was <strong>cut</strong>: it only matters if the valve is competitive in its best cell, and the whole bounded-gate question is a writeup vignette, not on the record critical path. The critical-path test is the <strong>Muon</strong> re-check (see below), which now leapfrogs the rest of the valve ablation.</p>
+<div class="warn">
+<strong>Finding 7 &mdash; the bounded "valve" gate is refuted; the linear gate wins decisively.</strong> Two valve cells (fast_sigmoid gate, zero-init at the max-derivative point), 5 seeds each, vs the linear-gate QuadGLU (xglu s=1, 6.8076):
+<table>
+<tr><th>Config</th><th>Mean</th><th>&Delta; vs linear</th><th>p</th></tr>
+<tr><td>linear-gate QuadGLU (xglu s=1)</td><td><strong>6.8076</strong></td><td>&mdash;</td><td>&mdash;</td></tr>
+<tr><td>valve, c=1 (best curvature), zero-init</td><td>6.8935</td><td>+0.086</td><td>0.00003</td></tr>
+<tr><td>valve, c=0.505 (variance-preserving), zero-init</td><td>6.9276</td><td>+0.120</td><td>0.00002</td></tr>
+</table>
+Clean decomposition: <strong>gate-type penalty (bounded vs linear) = +0.086</strong>, <strong>curvature penalty (c=0.505 vs c=1) = +0.034</strong> (p=0.0004), which add to the +0.12 of the worst cell. So even with every advantage (best curvature, gate started at max-derivative 0.5), the bounded gate loses by ~0.09 nats &mdash; an order of magnitude beyond the ~0.01&ndash;0.03 spread among the <em>good</em> variants. The transistor/division-of-labor hypothesis is dead: bounding the gate to [0,1] discards the sign-inversion and amplification the linear gate exploits, exactly as Shazeer 2020 and the prediction said. The two confirmed negatives of this round &mdash; the bounded gate and the variance-preserving low curvature &mdash; are clean writeup vignettes, and the <strong>linear-gate QuadGLU (x+x|x|) remains the best gated variant</strong>.
+</div>
+
+<p><strong>Now running &mdash; the Muon Gate-2 test (the critical-path experiment):</strong> per-variant Muon-LR probe (best-vs-best, fair) then <code>relu2</code> (standard MLP) vs <code>reglu s=1</code> vs <code>xglu s=1</code> under Muon, 4 seeds &times; 4000 steps. The first test on the optimizer that actually matters: does the gating win survive Muon? This, not the activation micro-shape, is what updates the record odds.</p>
 <h3>QuadGLU: a square-law gated unit</h3>
 
 <p>The cheap-gate and slope-floor results converge on a specific unit worth naming and testing on its own. Define the value activation</p>
