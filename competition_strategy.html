@@ -826,13 +826,12 @@ This is the cleanest possible test of the hypothesis "GELU shape vs ReLU&sup2; s
 <div class="good">
 <strong>Finding 6 &mdash; the slope floor helps, monotonically, and reshuffles the top.</strong> reglu improves cleanly with slope: <strong>6.8487 (s=0) &rarr; 6.8328 (s=0.5) &rarr; 6.8202 (s=1)</strong>. Fixing ReLU&sup2;&rsquo;s gradient-starved slow-start at the origin is a real, monotone win. Adding the same slope floor to x|x| gives <strong>xglu s=1 = QuadLU (x+x|x|) = 6.8076, the overall best</strong> &mdash; it edges reglu s=1 (6.8202) by 0.0126, but only at <strong>p=0.05</strong> (not significant at 0.01): with both gates given the slope floor, the negative half (x|x| vs ReLU&sup2;) is a near-tie. Conversely, adding sparsity via the threshold shift (t=0.5) <em>hurts</em> (6.8531): slope good, extra sparsity bad. The kernel target is a slope-1 square-law gate &mdash; QuadLU (x+x|x|) or, near-equivalently, ReLU(x)+ReLU(x)².</div>
 
-<p><strong>Still running / queued</strong> (a 2&times;2 over the bounded-gate QuadGLU, plus the half-zeroed control):</p>
+<p><strong>Still running (trimmed plan):</strong></p>
 <ul>
   <li><strong><code>reglu</code> s=1, c=0.253</strong> = ReLU(x)+0.253&middot;ReLU(x)&sup2; &mdash; the half-zeroed variance-preserving control. <em>Running.</em></li>
-  <li><strong>QuadGLU gate-type A/B</strong> (c=1): QuadLU value fixed (x+x|x|), gate varied across linear (already in table = xglu s=1), cheap rational valve <code>&frac12;&middot;x/(1+|x|)+&frac12;</code>, and true sigmoid &mdash; does bounding the gate help? <em>Queued.</em></li>
-  <li><strong>Gate-init A/B</strong>: same valve gate, zero-init vs default init &mdash; isolates whether starting the valve at its max-derivative point (0.5) matters. <em>Queued.</em></li>
-  <li><strong>Variance-preserving QuadGLU</strong>: valve gate, <strong>c=0.505</strong> (tuned for the eventual N(0,1) gate-input), &plusmn; zero-init. <em>Queued last.</em></li>
+  <li><strong>Decisive valve cell</strong>: the as-designed bounded-gate QuadGLU &mdash; fast_sigmoid gate, c=0.505 (variance-preserving), zero-init (valve at max-derivative 0.5). Its best shot vs the linear-gate baseline (xglu s=1, 6.8076). <em>Queued next.</em></li>
 </ul>
+<p class="muted">The rest of the bounded-gate 2&times;2 (c=1 cells, default-init cells, true-sigmoid control) was <strong>cut</strong>: it only matters if the valve is competitive in its best cell, and the whole bounded-gate question is a writeup vignette, not on the record critical path. The critical-path test is the <strong>Muon</strong> re-check (see below), which now leapfrogs the rest of the valve ablation.</p>
 <h3>QuadGLU: a square-law gated unit</h3>
 
 <p>The cheap-gate and slope-floor results converge on a specific unit worth naming and testing on its own. Define the value activation</p>
