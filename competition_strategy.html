@@ -776,6 +776,7 @@ This is the cleanest possible test of the hypothesis "GELU shape vs ReLU&sup2; s
 <tr><td>xglu (s=0)</td><td>gated</td><td>x|x|</td><td>6.8354</td></tr>
 <tr><td>reglu (s=0)</td><td>gated</td><td>ReLU&sup2; (cheap, fusable)</td><td>6.8487</td></tr>
 <tr><td>reglu s=1, t=0.5</td><td>gated</td><td>shifted ReLU&sup2;+slope (extra sparsity)</td><td>6.8531</td></tr>
+<tr><td>bilinear</td><td>gated</td><td>none (W&#8321;x &middot; W&#8322;x)</td><td>6.8565</td></tr>
 <tr><td>geglu</td><td>gated</td><td>GELU</td><td>6.8901</td></tr>
 <tr><td>triglu</td><td>gated</td><td>TriLU (frozen)</td><td>6.8934</td></tr>
 <tr><td>swiglu</td><td>gated</td><td>SiLU</td><td>6.8988</td></tr>
@@ -837,7 +838,28 @@ This is the cleanest possible test of the hypothesis "GELU shape vs ReLU&sup2; s
 Clean decomposition: <strong>gate-type penalty (bounded vs linear) = +0.086</strong>, <strong>curvature penalty (c=0.505 vs c=1) = +0.034</strong> (p=0.0004), which add to the +0.12 of the worst cell. So even with every advantage (best curvature, gate started at max-derivative 0.5), the bounded gate loses by ~0.09 nats &mdash; an order of magnitude beyond the ~0.01&ndash;0.03 spread among the <em>good</em> variants. The transistor/division-of-labor hypothesis is dead: bounding the gate to [0,1] discards the sign-inversion and amplification the linear gate exploits, exactly as Shazeer 2020 and the prediction said. The two confirmed negatives of this round &mdash; the bounded gate and the variance-preserving low curvature &mdash; are clean writeup vignettes, and the <strong>linear-gate QuadGLU (x+x|x|) remains the best gated variant</strong>.
 </div>
 
-<p><strong>Now running &mdash; the Muon Gate-2 test (the critical-path experiment):</strong> per-variant Muon-LR probe (best-vs-best, fair) then <code>relu2</code> (standard MLP) vs <code>reglu s=1</code> vs <code>xglu s=1</code> under Muon, 4 seeds &times; 4000 steps. The first test on the optimizer that actually matters: does the gating win survive Muon? This, not the activation micro-shape, is what updates the record odds.</p>
+<h3>Finding 8 &mdash; the gating win does NOT survive Muon (the headline result)</h3>
+
+<p>All of the above is under AdamW. The benchmark uses <strong>Muon</strong>, so we re-ran the key contrast under Muon (each variant at its own best Muon-LR; 4 seeds &times; 4000 steps):</p>
+
+<table>
+<tr><th>Variant (Muon)</th><th>Smoothed val</th><th>&Delta; vs standard ReLU&sup2;</th><th>p</th></tr>
+<tr><td>relu2 (standard MLP)</td><td>6.1996</td><td>&mdash;</td><td>&mdash;</td></tr>
+<tr><td>xglu s=1 (QuadLU gate)</td><td>6.1782</td><td>&minus;0.021</td><td>0.25 &mdash; <strong>tie</strong></td></tr>
+<tr><td>reglu s=1 (ReLU&sup2; gate)</td><td>6.3794</td><td>+0.180</td><td>0.007 &mdash; <strong>much worse</strong></td></tr>
+</table>
+
+<div class="warn">
+<strong>The AdamW gating win was largely an optimizer artifact.</strong> Under AdamW, gating beat the standard MLP by ~0.087 and reglu&asymp;xglu. Under Muon the best gated variant (xglu) only <em>ties</em> standard ReLU&sup2;, and reglu <em>collapses</em>. Since a gated MLP costs more (3 matmuls vs 2), a tie is a net loss on wallclock &mdash; so <strong>the gated-MLP record direction is not supported by Muon</strong>, and we should not spend rented-H100 budget on it. This is the Gate-2 test doing its job: it killed the direction for ~$0. (A refined run with parabola-fit per-variant LRs + bilinear is in progress to confirm the tie isn't LR-mistuning; preliminary refined relu2 &asymp; 6.178.)
+</div>
+
+<h4>Why the optimizer reorders the ranking</h4>
+<p>An optimizer doesn&rsquo;t just change speed &mdash; it changes <em>which architectural properties matter</em>. <strong>AdamW</strong> is per-coordinate adaptive (divides by each weight&rsquo;s gradient RMS), so it is forgiving of scale/conditioning/sparsity and architectures compete on raw <em>expressivity</em> &mdash; gating wins. <strong>Muon</strong> orthogonalizes each weight matrix&rsquo;s update (Newton-Schulz &asymp; UV&#7488;), flattening the singular-value spectrum, so it is sensitive to the <em>conditioning/rank</em> of the gradient &mdash; which the activation statistics control. Two consequences seen here: (1) Muon optimizes the dense standard MLP <em>much</em> better (relu2 6.93&rarr;6.20), closing the expressivity gap gating was filling; (2) ReLU&sup2;&rsquo;s sparse, non-negative activations (~50% zeros) make the <code>fc&#8322;</code> gradient ill-conditioned &rarr; orthogonalization amplifies near-null directions &rarr; reglu collapses, while dense x|x| (xglu) stays well-conditioned and survives. AdamW hides all of this by rescaling per-coordinate (&ldquo;Muon makes activation scale non-absorbable&rdquo;). Bilinear under Muon (in progress) is a clean test of the sparsity mechanism: linear branches are maximally dense, so it should pattern with xglu, not reglu.</p>
+
+<h3>Future direction: a systematic activation-function study under Muon</h3>
+<p>This finding generalizes into the project&rsquo;s most promising deliverable. The entire activation-function canon &mdash; GELU (2016), Swish/SiLU (2017), SwiGLU / GLU-variants (Shazeer 2020) &mdash; was established under <em>Adam-family</em> optimizers (Adam/RMSProp/Adafactor). Muon and the broader orthogonalizing / second-order family (Shampoo, SOAP) postdate essentially all of it, and the literature implicitly assumes <strong>optimizer-invariance</strong> of activation rankings. Our results show that assumption is false in a strong way (gating&rsquo;s advantage reverses; ReLU&sup2; collapses). A systematic <strong>&ldquo;activation functions under Muon&rdquo;</strong> study is therefore a genuine, largely-unfilled gap and a strong portfolio piece &mdash; arguably more distinctive than a marginal speedrun record, and publishable with or without one.</p>
+<p>As a <em>blog post / workshop contribution</em> it is achievable now: the Adam-vs-Muon ranking reversal plus the conditioning/sparsity mechanism is novel and shareable. As a <em>serious paper</em> it would need: (a) rigorous per-optimizer, per-activation hyperparameter co-tuning (to rule out the &ldquo;tuned baseline vs untuned alternatives&rdquo; critique &mdash; the parabola-LR refinement is the start); (b) multiple model scales (does the effect grow from 125M&rarr;1B?); (c) disentangling activation shape from MLP structure ((8/3)d vs 4d, 3 matmuls vs 2); (d) generality across the orthogonalizing-optimizer family (Muon / Shampoo / SOAP) to make it a statement about a class, not a Muon quirk; (e) a literature check for scoop risk (Muon is a hot area). Today&rsquo;s runs are the pilot that motivates that study.</p>
+
 <h3>QuadGLU: a square-law gated unit</h3>
 
 <p>The cheap-gate and slope-floor results converge on a specific unit worth naming and testing on its own. Define the value activation</p>
