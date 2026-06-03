@@ -770,7 +770,8 @@ This is the cleanest possible test of the hypothesis "GELU shape vs ReLU&sup2; s
 
 <table>
 <tr><th>Variant</th><th>MLP</th><th>Shape</th><th>Mean val</th><th>Std</th></tr>
-<tr><td><strong>reglu</strong></td><td>gated</td><td>ReLU&sup2; (cheap, fusable)</td><td><strong>6.8487</strong></td><td>0.0485</td></tr>
+<tr><td><strong>xglu</strong></td><td>gated</td><td>x|x| (cheap, fusable)</td><td><strong>6.8354</strong></td><td>0.0480</td></tr>
+<tr><td>reglu</td><td>gated</td><td>ReLU&sup2; (cheap, fusable)</td><td>6.8487</td><td>0.0485</td></tr>
 <tr><td>geglu</td><td>gated</td><td>GELU</td><td>6.8901</td><td>0.0505</td></tr>
 <tr><td>triglu</td><td>gated</td><td>TriLU (frozen)</td><td>6.8934</td><td>0.0533</td></tr>
 <tr><td>swiglu</td><td>gated</td><td>SiLU</td><td>6.8988</td><td>0.0489</td></tr>
@@ -802,28 +803,30 @@ This is the cleanest possible test of the hypothesis "GELU shape vs ReLU&sup2; s
 <strong>Finding 4 &mdash; the cheapest gate is also the best.</strong> reglu (6.8487) beats every smooth-gate variant on a paired basis: vs geglu &minus;0.0414 (p=0.00004), vs triglu &minus;0.0447 (p=0.00007), vs swiglu &minus;0.0501 (p&lt;0.00001) &mdash; winning on essentially every seed. So &ldquo;shape barely matters&rdquo; held only <em>within</em> the smooth-gate family; the sparse / non-negative ReLU&sup2; shape breaks out of the cluster. This mirrors the standard-MLP row, where ReLU&sup2; also won &mdash; a single coherent story: <strong>ReLU&sup2;&rsquo;s sparsity + non-negativity helps in both the standard and the gated MLP.</strong> Strategically near-best-case: the activation that is cheapest to fuse (no transcendentals, existing kernel) is also the most accurate, so the gated-MLP kernel target is now concrete &mdash; a ReLU&sup2;-gate.
 </div>
 
-<div class="warn">
-<strong>Tentative &mdash; xglu may beat reglu (2 of 5 seeds, NOT yet significant).</strong> The second cheap gate, <strong>xglu</strong> = gated <em>x|x|</em> (sign(x)&middot;x&sup2;; also transcendental-free and fusable), is edging reglu on both completed seeds: 6.7945 vs 6.8027 and 6.8291 vs 6.8353, mean &Delta; = +0.0072 favoring xglu, but <strong>paired p = 0.087 at n=2 &mdash; inconclusive.</strong> If it holds across all 5 seeds it would invert the standard-MLP lesson: in a gated MLP, <em>using</em> the negative half of the input (x|x|, no sparsity) would beat <em>zeroing</em> it (ReLU&sup2;) &mdash; plausibly because the gate already handles selection, so the activation branch benefits from passing more information rather than sparsifying. Either way the kernel target stays a cheap polynomial gate. Result pending; xglu&rsquo;s row will join the table when its run completes.
+<div class="good">
+<strong>Finding 5 &mdash; xglu (gated x|x|) is the best gate, beating reglu (5 seeds, p&lt;0.01).</strong> The second cheap gate, <strong>xglu</strong> = gated <em>x|x|</em> (sign(x)&middot;x&sup2;; also transcendental-free and fusable), wins on all 5 seeds: mean 6.8354 vs reglu 6.8487, paired &Delta; = +0.0133, <strong>t=5.07, p=0.0072</strong>. This <em>inverts</em> the standard-MLP lesson: in a gated MLP, <em>using</em> the negative half of the input (x|x|, no sparsity) beats <em>zeroing</em> it (ReLU&sup2;) &mdash; plausibly because the gate already handles selection, so the activation branch benefits from passing more information rather than sparsifying. Two honest caveats: the effect is <em>small</em> (0.013 nats, vs reglu&rsquo;s ~0.04 lead over the smooth gates), and p=0.0072 is the closest of the gated contrasts &mdash; it clears 0.01 but would not survive aggressive multiple-comparison correction. The kernel target stays a cheap polynomial gate either way (x|x| is just <code>x*x.abs()</code>).
 </div>
 
 <p><strong>Caveat (init fairness).</strong> All variants use the shared default <code>nn.Linear</code> init, which is not each activation&rsquo;s variance-optimal init &mdash; so this is a fair <em>drop-in</em> comparison, not yet a pure <em>shape</em> comparison. LayerNorm launders much of the mismatch, and ReLU&sup2; is arguably the activation the generic init suits <em>least</em> (no closed-form init), so its win is hard to dismiss as init-luck. A small init-gain sweep (reglu vs xglu at 2&ndash;3 init scales) is the clean way to separate shape from init before claiming the mechanistic result; queued as a follow-up.</p>
 
-<h3>Planned: activation-shape sweep (slope floor)</h3>
+<h3>Activation-shape sweep (slope floor + curvature) &mdash; RUNNING</h3>
 
-<p>Both winning gates are quadratic, so both have a gradient-starved flat spot at the origin: ReLU&sup2; has derivative 2x &rarr; 0 as x&rarr;0&#8314;, and x|x| has derivative 2|x| &rarr; 0 from both sides. Small pre-activations learn slowly. The fix is a linear term giving a nonzero slope s at the origin, leaving cost and fusability unchanged:</p>
+<p>Both winning gates are quadratic, so both have a gradient-starved flat spot at the origin: ReLU&sup2; has derivative 2x &rarr; 0 as x&rarr;0&#8314;, and x|x| has derivative 2|x| &rarr; 0 from both sides. Small pre-activations learn slowly. The fix is a linear term giving a nonzero slope s at the origin; a curvature coefficient c scales the quadratic term. Both leave cost and fusability unchanged:</p>
 
 <table>
 <tr><th>Family</th><th>Form</th><th>Derivative</th><th>At x=0</th></tr>
-<tr><td>ReLU&sup2; (reglu)</td><td>ReLU(x&minus;t)&sup2; + s&middot;ReLU(x&minus;t)</td><td>2(x&minus;t)+s on the active side</td><td>slope s; t shifts threshold (more sparsity)</td></tr>
-<tr><td>x|x| (xglu)</td><td>x|x| + s&middot;x</td><td>2|x| + s</td><td>slope s, both sides; stays odd</td></tr>
+<tr><td>ReLU&sup2; (reglu)</td><td>c&middot;ReLU(x&minus;t)&sup2; + s&middot;ReLU(x&minus;t)</td><td>2c(x&minus;t)+s on the active side</td><td>slope s; t shifts threshold (more sparsity)</td></tr>
+<tr><td>x|x| (xglu)</td><td>c&middot;x|x| + s&middot;x</td><td>2c|x| + s</td><td>slope s, both sides; stays odd</td></tr>
 </table>
 
-<p>Queued sweep (medium config, 5 seeds each, runs after the cheap-gate run frees the GPU; harness flags <code>--act-slope</code> / <code>--act-shift</code>):</p>
+<p>Sweep (medium config, 5 seeds each; harness flags <code>--act-slope</code> / <code>--act-shift</code> / <code>--act-curv</code>):</p>
 <ul>
-  <li><code>reglu</code> at <strong>s=0.5, t=0</strong> and <strong>s=1, t=0</strong> &mdash; does a slope floor beat plain ReLU&sup2; (s=0, already measured at 6.8487)?</li>
-  <li><code>reglu</code> at <strong>s=1, t=0.5</strong> &mdash; slope floor plus mild extra sparsity.</li>
-  <li><code>xglu</code> at <strong>s=1, t=0</strong> &mdash; the two-sided analog. Its positive branch (x&sup2;+x) is identical to reglu s=1, so any reglu-vs-xglu gap at s=1 isolates exactly what the <em>negative</em> half contributes.</li>
+  <li><code>reglu</code> at <strong>s=0.5, t=0</strong> &mdash; <em>running; preliminary mean &asymp; 6.844 at 4/5 seeds</em>, i.e. roughly tied with plain reglu (6.8487). A slope floor of 0.5 looks near-neutral so far.</li>
+  <li><code>reglu</code> at <strong>s=1, t=0</strong> and <strong>s=1, t=0.5</strong> &mdash; full slope floor, and slope floor plus mild extra sparsity. <em>Queued.</em></li>
+  <li><code>xglu</code> at <strong>s=1, t=0</strong> &mdash; the two-sided analog. Its positive branch (x&sup2;+x) is identical to reglu s=1, so any gap at s=1 isolates what the <em>negative</em> half contributes. <em>Queued.</em></li>
+  <li><strong><code>xglu</code> at s=1, c=0.253</strong> = <strong>x + 0.253&middot;x|x|</strong> &mdash; the variance-preserving member: slope 1 at the origin, monotonic, positive curvature, and (gated, half-zeroed) unit-variance output for standard-normal input. <em>Queued (runs last).</em></li>
 </ul>
+<p class="muted">Why x + 0.253&middot;x|x|: with slope fixed at 1, the gate zeroing half the mass makes the linear term contribute only 0.5 to the output variance, leaving room for a <em>positive</em> curvature c=0.253 to fill it back to 1. (Standalone &mdash; ungated &mdash; only c&le;0 hits variance 1, so the gating is what makes a positive, monotonic, slope-1, normalization-preserving quadratic possible.) It is the cleanest candidate of the family: healthy small-x gradients, genuine curvature, scale-preserving by construction.</p>
 <p class="muted">Held for the round after: the SE-style gate-pooling sweep (C7, k&isin;{4,8,16}) and the init-gain fairness sweep. Pooling is ~orthogonal to the activation shape (it acts on the linear gate branch), so the final config combines the best shape with the best pooling factor.</p>
 
 <p>Plots: <code>experiments/trilu/val_loss.png</code> (val loss vs step, mean &plusmn; std band), <code>dead_zones.png</code> (dead-fraction over training), <code>trilu_trajectories.png</code> (flat &mdash; frozen run).</p>
@@ -831,7 +834,7 @@ This is the cleanest possible test of the hypothesis "GELU shape vs ReLU&sup2; s
 <h3>Implications for strategy</h3>
 <ul>
   <li><strong>Demote A1 (TriLU as the activation).</strong> The clean-shape-test motivation is gone: frozen TriLU is the worst standard variant. A learnable-TriLU run is still worth doing as a secondary test (does drift help?), but the &ldquo;ReLU&sup2; won on cost not shape&rdquo; thesis is dead at this scale. Do <em>not</em> spend H100 budget on frozen-TriLU Track-1 validation.</li>
-  <li><strong>Promote B1 (fused gated-MLP kernel), with a concrete activation.</strong> Gating is the real, large, significant effect, and Finding 4 names the target: a <strong>ReLU&sup2;-gate</strong> &mdash; cheapest to fuse and the most accurate. The Phase 2 pivot is now the main line: build a fused ReLU&sup2;-gated MLP and co-tune it against the full modded-nanogpt stack in Phase 1.5.</li>
+  <li><strong>Promote B1 (fused gated-MLP kernel), with a concrete activation.</strong> Gating is the real, large, significant effect, and the cheap-gate follow-ups name the target: a <strong>cheap polynomial gate</strong> &mdash; currently <strong>x|x| (xglu)</strong> narrowly best (Finding 5), with ReLU&sup2; a close second; the activation-shape sweep may refine which. Both are transcendental-free and fusable, so the kernel plan is robust to the exact winner. The Phase 2 pivot is now the main line: build a fused gated MLP with the winning cheap gate and co-tune it against the full modded-nanogpt stack in Phase 1.5.</li>
   <li><strong>B5 / C7 dependency conditions are met.</strong> Both were gated on &ldquo;Phase 1 establishing gated MLPs as viable.&rdquo; They are now live: 4-bit gated-W&#8322; quantization (B5) and SE-style compressed gate input (C7) become candidate follow-ons <em>if</em> the gated kernel survives Phase 1.5.</li>
   <li><strong>Next local round (cheap, before any H100 spend).</strong> Settle the cheap-gate winner (reglu vs xglu, full seeds), then the activation-shape sweep above (slope floor / shift), then the gate-pooling and init-gain sweeps. All run on the local 5060&nbsp;Ti at no marginal cost; only the surviving best config goes to an H100 for Phase 1.5 co-tuning.</li>
   <li><strong>The scale/scaffold caveat still binds.</strong> No Muon / FP8 / softcap here. Gating&rsquo;s 0.087-nat win must be re-confirmed inside <code>train_gpt.py</code> on a single H100 before any record attempt &mdash; Muon&rsquo;s spectral-norm bias and the param-count rebalance ((8/3)d vs 4d hidden) interact with gating in ways this harness can&rsquo;t see.</li>

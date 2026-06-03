@@ -62,14 +62,17 @@ class ReLU2(nn.Module):
     so t=0 is ~50% dead, t=1 ~84% dead). Still transcendental-free and fusable.
     """
 
-    def __init__(self, slope: float = 0.0, shift: float = 0.0):
+    def __init__(self, slope: float = 0.0, shift: float = 0.0, curv: float = 1.0):
         super().__init__()
         self.slope = slope
         self.shift = shift
+        self.curv = curv
 
     def forward(self, x):
         z = F.relu(x - self.shift) if self.shift else F.relu(x)
         out = z.square()
+        if self.curv != 1.0:
+            out = self.curv * out
         if self.slope:
             out = out + self.slope * z
         return out
@@ -86,16 +89,22 @@ class XAbsX(nn.Module):
     scaling for the gate branch is Var[W₂x] = 1/3 if you want output variance 1.
 
     Plain x|x| has derivative 2|x|, which is 0 at the origin (slow-start from both
-    sides). The slope term s gives derivative 2|x|+s, i.e. slope s at x=0, fixing
+    sides). The slope term s gives derivative c*2|x|+s, i.e. slope s at x=0, fixing
     the gradient-starved flat spot while keeping the function odd. s=1 is the
-    two-sided analog of the sloped ReLU² (its positive branch x²+x matches exactly).
+    two-sided analog of the sloped ReLU² (its positive branch c*x²+x matches exactly).
+    The curvature c scales the x|x| term: f(x) = c*x|x| + s*x. With s=1, gating
+    (half the outputs zeroed) and c=0.253, a standard-normal input gives unit-variance
+    output (the variance-preserving, slope-1, monotonic member of the family).
     """
-    def __init__(self, slope: float = 0.0):
+    def __init__(self, slope: float = 0.0, curv: float = 1.0):
         super().__init__()
         self.slope = slope
+        self.curv = curv
 
     def forward(self, x):
         out = x * x.abs()
+        if self.curv != 1.0:
+            out = self.curv * out
         if self.slope:
             out = out + self.slope * x
         return out
@@ -173,7 +182,7 @@ class TriLU(nn.Module):
 
 
 def make_activation(name: str, init: str = "gelu_minimax",
-                    act_slope: float = 0.0, act_shift: float = 0.0):
+                    act_slope: float = 0.0, act_shift: float = 0.0, act_curv: float = 1.0):
     """Factory that returns a fresh activation module each call.
 
     For gated variants, returns the *inner* activation; the MLP class handles gating.
@@ -181,7 +190,7 @@ def make_activation(name: str, init: str = "gelu_minimax",
     act_shift affects the ReLU² family only.
     """
     if name in ("relu2", "reglu"):
-        return ReLU2(slope=act_slope, shift=act_shift)
+        return ReLU2(slope=act_slope, shift=act_shift, curv=act_curv)
     if name in ("gelu", "geglu"):
         return nn.GELU()
     if name == "swiglu":
@@ -191,7 +200,7 @@ def make_activation(name: str, init: str = "gelu_minimax",
     if name in ("trilu_asym", "triglu"):
         return TriLU(asymmetric=True, init=init)
     if name in ("xabsx", "xglu"):
-        return XAbsX(slope=act_slope)
+        return XAbsX(slope=act_slope, curv=act_curv)
     raise ValueError(f"Unknown activation: {name}")
 
 
@@ -305,9 +314,9 @@ class GatedMLP(nn.Module):
 
 def make_mlp(dim: int, model_dim: int, act_name: str, act_init: str,
              gate_pool: int = 1, gate_pool_type: str = "mean",
-             act_slope: float = 0.0, act_shift: float = 0.0) -> nn.Module:
+             act_slope: float = 0.0, act_shift: float = 0.0, act_curv: float = 1.0) -> nn.Module:
     """Build an MLP block. Hidden dim chosen to match params: 4d for standard, (8/3)d for gated."""
-    act = make_activation(act_name, act_init, act_slope=act_slope, act_shift=act_shift)
+    act = make_activation(act_name, act_init, act_slope=act_slope, act_shift=act_shift, act_curv=act_curv)
     if act_name in GATED_ACTIVATIONS:
         # 8/3 * d, rounded to nearest multiple of 64 for hardware-friendliness
         hidden = max(64, round(8 * model_dim / 3 / 64) * 64)
@@ -319,14 +328,14 @@ def make_mlp(dim: int, model_dim: int, act_name: str, act_init: str,
 
 class Block(nn.Module):
     def __init__(self, dim, num_heads, model_dim, act_name, act_init,
-                 gate_pool=1, gate_pool_type="mean", act_slope=0.0, act_shift=0.0):
+                 gate_pool=1, gate_pool_type="mean", act_slope=0.0, act_shift=0.0, act_curv=1.0):
         super().__init__()
         self.ln1 = nn.LayerNorm(dim)
         self.attn = CausalSelfAttention(dim, num_heads)
         self.ln2 = nn.LayerNorm(dim)
         self.mlp = make_mlp(dim, model_dim, act_name, act_init,
                             gate_pool=gate_pool, gate_pool_type=gate_pool_type,
-                            act_slope=act_slope, act_shift=act_shift)
+                            act_slope=act_slope, act_shift=act_shift, act_curv=act_curv)
 
     def forward(self, x):
         x = x + self.attn(self.ln1(x))
@@ -336,7 +345,7 @@ class Block(nn.Module):
 
 class TinyGPT(nn.Module):
     def __init__(self, vocab_size, num_layers, dim, num_heads, seq_len, act_name, act_init,
-                 gate_pool=1, gate_pool_type="mean", act_slope=0.0, act_shift=0.0):
+                 gate_pool=1, gate_pool_type="mean", act_slope=0.0, act_shift=0.0, act_curv=1.0):
         super().__init__()
         self.token_embed = nn.Embedding(vocab_size, dim)
         self.pos_embed = nn.Embedding(seq_len, dim)
@@ -344,7 +353,7 @@ class TinyGPT(nn.Module):
         self.blocks = nn.ModuleList([
             Block(dim, num_heads, dim, act_name, act_init,
                   gate_pool=gate_pool, gate_pool_type=gate_pool_type,
-                  act_slope=act_slope, act_shift=act_shift)
+                  act_slope=act_slope, act_shift=act_shift, act_curv=act_curv)
             for _ in range(num_layers)
         ])
         self.ln_f = nn.LayerNorm(dim)
@@ -494,6 +503,7 @@ def train_one(config, train_data, val_data, seed, device):
         gate_pool=config.get("gate_pool", 1),
         gate_pool_type=config.get("gate_pool_type", "mean"),
         act_slope=config.get("act_slope", 0.0),
+        act_curv=config.get("act_curv", 1.0),
         act_shift=config.get("act_shift", 0.0),
     ).to(device)
 
@@ -632,6 +642,12 @@ def main():
     ap.add_argument("--act-shift", type=float, default=0.0,
                     help="threshold shift t of the ReLU² family (larger t -> more sparsity). "
                          "Affects relu2/reglu only.")
+    ap.add_argument("--act-curv", type=float, default=1.0,
+                    help="curvature c, the coefficient on the quadratic term: ReLU² family "
+                         "c·ReLU(x-t)²+s·ReLU(x-t); x|x| family c·x|x|+s·x. c=1 is the plain "
+                         "activation. With --act-slope 1 and a gated MLP, c=0.253 makes a "
+                         "standard-normal input give unit-variance output. Affects relu2/reglu "
+                         "and xabsx/xglu.")
     args = ap.parse_args()
 
     if args.tiny:
@@ -646,6 +662,7 @@ def main():
     cfg_base["gate_pool_type"] = args.gate_pool_type
     cfg_base["act_slope"] = args.act_slope
     cfg_base["act_shift"] = args.act_shift
+    cfg_base["act_curv"] = args.act_curv
 
     device = pick_device(args.device)
     print(f"Device: {device}")
@@ -671,6 +688,8 @@ def main():
             key += f"_pool{args.gate_pool}{args.gate_pool_type[0]}"
         if args.act_slope or args.act_shift:
             key += f"_s{args.act_slope:g}t{args.act_shift:g}"
+        if args.act_curv != 1.0:
+            key += f"_c{args.act_curv:g}"
         all_results[key] = []
         for seed in range(args.seeds):
             print(f"\n=== activation={act}  gate_pool={args.gate_pool}  seed={seed} ===")
