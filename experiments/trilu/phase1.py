@@ -481,6 +481,100 @@ def get_lr(step, total_steps, max_lr, min_lr, warmup):
     return min_lr + 0.5 * (max_lr - min_lr) * (1.0 + math.cos(math.pi * progress))
 
 
+def lr_mult(step, total_steps, warmup, min_frac=0.1):
+    """Schedule as a multiplier in [~0, 1] (warmup then cosine to min_frac)."""
+    return get_lr(step, total_steps, 1.0, min_frac, warmup)
+
+
+# -----------------------------------------------------------------------------
+# Muon optimizer (single-GPU). The real modded-nanogpt optimizer: momentum SGD on
+# the hidden weight matrices, with each update orthogonalized via Newton-Schulz.
+# Embeddings / norms / scalar activation params use AdamW instead. We add it here
+# because Muon "makes activation scale non-absorbable" -- so an activation/gate win
+# under AdamW must be re-confirmed under Muon before it means anything for the record.
+
+@torch.no_grad()
+def zeropower_via_newtonschulz5(G, steps=5):
+    """Orthogonalize G (2D) via the quintic Newton-Schulz iteration (Keller Jordan)."""
+    assert G.ndim == 2
+    a, b, c = 3.4445, -4.7750, 2.0315
+    X = G.bfloat16()
+    transpose = G.size(0) > G.size(1)
+    if transpose:
+        X = X.T
+    X = X / (X.norm() + 1e-7)
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * (A @ A)
+        X = a * X + B @ X
+    if transpose:
+        X = X.T
+    return X.to(G.dtype)
+
+
+class Muon(torch.optim.Optimizer):
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5):
+        super().__init__(params, dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps))
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            lr, momentum = group["lr"], group["momentum"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                g = p.grad
+                state = self.state[p]
+                if "momentum_buffer" not in state:
+                    state["momentum_buffer"] = torch.zeros_like(g)
+                buf = state["momentum_buffer"]
+                buf.mul_(momentum).add_(g)
+                g = g.add(buf, alpha=momentum) if group["nesterov"] else buf
+                g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
+                # shape-aware scale so the RMS update is comparable across matrices
+                p.add_(g, alpha=-lr * max(1.0, p.size(0) / p.size(1)) ** 0.5)
+
+
+def build_optimizers(model, config):
+    """Return a list of optimizers. Each param group carries a 'base_lr' that the
+    training loop scales by the shared schedule multiplier.
+
+    AdamW path (default): one AdamW over everything, activation params at 0.1x.
+    Muon path: Muon over the hidden weight matrices (2D params inside blocks),
+    AdamW over embeddings / norms / activation params."""
+    freeze_trilu = config.get("freeze_trilu", False)
+    body, act, other = [], [], []
+    for name, p in model.named_parameters():
+        if "theta_" in name:
+            if freeze_trilu:
+                p.requires_grad_(False)
+            else:
+                act.append(p)
+        elif p.ndim == 2 and name.startswith("blocks"):
+            body.append(p)
+        else:
+            other.append(p)
+
+    lr = config["lr"]
+    adam_groups = []
+
+    def add_adam(params, base):
+        if params:
+            adam_groups.append({"params": params, "base_lr": base, "lr": base})
+
+    opts = []
+    if config.get("optimizer", "adamw") == "muon":
+        mlr = config.get("muon_lr", 0.02)
+        opts.append(Muon([{"params": body, "base_lr": mlr, "lr": mlr}], lr=mlr))
+        add_adam(other, lr)
+    else:
+        add_adam(body + other, lr)
+    add_adam(act, lr * 0.1)
+    if adam_groups:
+        opts.append(torch.optim.AdamW(adam_groups, betas=(0.9, 0.95), weight_decay=0.1))
+    return opts
+
+
 def collect_trilu_params(model: nn.Module):
     snap = []
     for name, mod in model.named_modules():
@@ -553,37 +647,23 @@ def train_one(config, train_data, val_data, seed, device):
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"  params: {n_params:,}")
+    print(f"  params: {n_params:,}  optimizer={config.get('optimizer','adamw')}")
 
-    # Separate param groups: main weights at full LR, TriLU activation params at 0.1x.
-    # If --freeze-trilu, the activation params are frozen at their init values.
     freeze_trilu = config.get("freeze_trilu", False)
-    main_params, act_params = [], []
-    for name, p in model.named_parameters():
-        if "theta_" in name:
-            if freeze_trilu:
-                p.requires_grad_(False)
-            else:
-                act_params.append(p)
-        else:
-            main_params.append(p)
-
-    param_groups = [{"params": main_params, "lr": config["lr"]}]
-    if act_params:
-        param_groups.append({"params": act_params, "lr": config["lr"] * 0.1})
-    optimizer = torch.optim.AdamW(param_groups, betas=(0.9, 0.95), weight_decay=0.1)
+    optimizers = build_optimizers(model, config)
     if freeze_trilu and config["activation"] in ("trilu_sym", "trilu_asym", "triglu"):
         print(f"  TriLU activation params FROZEN at init (0 learnable activation params)")
 
     has_trilu = config["activation"] in ("trilu_sym", "trilu_asym", "triglu")
+    total_steps, warmup = config["total_steps"], config["warmup"]
     log = {"val_loss": [], "trilu_params": [], "dead_zones": [], "wallclock": [], "config": config, "seed": seed}
 
     t0 = time.time()
-    for step in range(config["total_steps"]):
-        cur_lr = get_lr(step, config["total_steps"], config["lr"], config["lr"] * 0.1, config["warmup"])
-        optimizer.param_groups[0]["lr"] = cur_lr
-        if len(optimizer.param_groups) > 1:
-            optimizer.param_groups[1]["lr"] = cur_lr * 0.1
+    for step in range(total_steps):
+        mult = lr_mult(step, total_steps, warmup)
+        for opt in optimizers:
+            for g in opt.param_groups:
+                g["lr"] = g["base_lr"] * mult
 
         batch = sample_batch(train_data, config["batch_size"], config["seq_len"], device, gen_train)
         x, y = batch[:, :-1], batch[:, 1:]
@@ -591,12 +671,14 @@ def train_one(config, train_data, val_data, seed, device):
         with amp_ctx:
             _, loss = model(x, y)
 
-        optimizer.zero_grad(set_to_none=True)
+        for opt in optimizers:
+            opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
+        for opt in optimizers:
+            opt.step()
 
-        if step % config["eval_every"] == 0 or step == config["total_steps"] - 1:
+        if step % config["eval_every"] == 0 or step == total_steps - 1:
             val_loss = evaluate(model, val_data, config["batch_size"], config["seq_len"], device, gen_val)
             dead = measure_dead_zones(model, val_data, config["batch_size"], config["seq_len"], device, gen_val)
             mean_dead = sum(f for _, f in dead) / max(len(dead), 1)
@@ -606,9 +688,20 @@ def train_one(config, train_data, val_data, seed, device):
             log["dead_zones"].append([step, dead])
             if has_trilu:
                 log["trilu_params"].append([step, collect_trilu_params(model)])
-            print(f"  step {step:5d}  lr={cur_lr:.5f}  train={loss.item():.4f}  val={val_loss:.4f}  "
-                  f"dead={mean_dead:.3f}  t={elapsed:.1f}s")
+            print(f"  step {step:5d}  lr={optimizers[0].param_groups[0]['lr']:.5f}  train={loss.item():.4f}  "
+                  f"val={val_loss:.4f}  dead={mean_dead:.3f}  t={elapsed:.1f}s")
 
+    # Convergence metrics (less noisy / better aligned with steps-to-target than the
+    # single final eval): smoothed final loss, area under the val curve, steps-to-target.
+    vals = [v for _, v in log["val_loss"]]
+    k = min(5, len(vals))
+    log["final_loss"] = vals[-1]
+    log["final_loss_smoothed"] = sum(vals[-k:]) / k
+    log["auc"] = sum(vals) / len(vals)
+    target = config.get("target_loss")
+    log["steps_to_target"] = next((s for s, v in log["val_loss"] if v <= target), None) if target else None
+    print(f"  -> final={log['final_loss']:.4f}  smoothed(last{k})={log['final_loss_smoothed']:.4f}  "
+          f"auc={log['auc']:.4f}  steps_to_target={log['steps_to_target']}")
     return log
 
 
@@ -702,6 +795,12 @@ def main():
                     help="zero-init the gate matrix. With a bounded gate this starts every valve "
                          "at 0.5 (max-derivative, agnostic), learning its direction from there; "
                          "with a linear gate it zeroes the block output (ReZero-style). Gated only.")
+    ap.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "muon"],
+                    help="adamw (default) or muon (Newton-Schulz-orthogonalized momentum on the "
+                         "hidden matrices, AdamW on embeddings/norms) -- the real modded-nanogpt optimizer.")
+    ap.add_argument("--muon-lr", type=float, default=0.02, help="base LR for the Muon group.")
+    ap.add_argument("--target-loss", type=float, default=None,
+                    help="if set, log steps-to-reach this val loss (benchmark-aligned metric).")
     args = ap.parse_args()
 
     if args.tiny:
@@ -719,6 +818,9 @@ def main():
     cfg_base["act_curv"] = args.act_curv
     cfg_base["gate_act"] = args.gate_act
     cfg_base["gate_zero_init"] = args.gate_zero_init
+    cfg_base["optimizer"] = args.optimizer
+    cfg_base["muon_lr"] = args.muon_lr
+    cfg_base["target_loss"] = args.target_loss
 
     device = pick_device(args.device)
     print(f"Device: {device}")
@@ -750,6 +852,8 @@ def main():
             key += f"_g{args.gate_act}"
         if args.gate_zero_init:
             key += "_zg"
+        if args.optimizer != "adamw":
+            key += f"_{args.optimizer}"
         all_results[key] = []
         for seed in range(args.seeds):
             print(f"\n=== activation={act}  gate_pool={args.gate_pool}  seed={seed} ===")
