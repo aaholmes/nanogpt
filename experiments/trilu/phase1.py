@@ -203,11 +203,15 @@ def make_activation(name: str, init: str = "gelu_minimax",
         return TriLU(asymmetric=True, init=init)
     if name in ("xabsx", "xglu"):
         return XAbsX(slope=act_slope, curv=act_curv)
+    if name == "bilinear":
+        # No activation: gated MLP becomes (W1 x) * (W2 x) -- Shazeer's Bilinear.
+        # The nonlinearity is purely the multiplicative gate. Cheapest gated variant.
+        return nn.Identity()
     raise ValueError(f"Unknown activation: {name}")
 
 
 # Activations that use gated MLP (3 matmuls, hidden dim = round(8/3 * model_dim))
-GATED_ACTIVATIONS = {"swiglu", "geglu", "triglu", "xglu", "reglu"}
+GATED_ACTIVATIONS = {"swiglu", "geglu", "triglu", "xglu", "reglu", "bilinear"}
 
 
 # -----------------------------------------------------------------------------
@@ -741,7 +745,7 @@ CONFIGS = {
 
 
 ALL_ACTIVATIONS = ["relu2", "gelu", "trilu_sym", "trilu_asym", "swiglu", "geglu", "triglu",
-                   "xabsx", "xglu", "reglu"]
+                   "xabsx", "xglu", "reglu", "bilinear"]
 
 # Default 7-activation sweep covering the standard/gated x ReLU-like/GELU-like/TriLU comparison,
 # plus xglu (gated x|x|) which tests using the negative half of the input distribution.
