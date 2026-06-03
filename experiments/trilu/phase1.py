@@ -278,18 +278,42 @@ class ChannelPool(nn.Module):
         return g.mean(dim=-1)
 
 
+def apply_gate_act(g: torch.Tensor, mode: str) -> torch.Tensor:
+    """Nonlinearity on the gate branch (the 'whether-on' control).
+
+    linear        : g                         (default; unbounded, signed -- SwiGLU-style)
+    fast_sigmoid  : 0.5*g/(1+|g|) + 0.5        (cheap rational 0-1 valve, no transcendental;
+                                                gentle polynomial-tail saturation)
+    sigmoid       : 1/(1+e^-g)                 (true 0-1 valve; transcendental)
+
+    The bounded gates implement the "transistor" division of labor: the gate decides
+    *whether* a unit is on (0-1), the value branch decides the output *when* on. The
+    linear gate (the modern SwiGLU default) instead lets the gate also amplify and
+    flip sign -- which is why it tends to win.
+    """
+    if mode == "fast_sigmoid":
+        return 0.5 * g / (1.0 + g.abs()) + 0.5
+    if mode == "sigmoid":
+        return torch.sigmoid(g)
+    return g  # linear
+
+
 class GatedMLP(nn.Module):
-    """Gated MLP (SwiGLU / GeGLU / TriGLU): W2 . ( act(W1.x) * (V.x) ).
+    """Gated MLP (SwiGLU / GeGLU / TriGLU): W2 . ( act(W1.x) * gate_act(V.x) ).
 
     With gate_pool > 1, the gate branch V sees a channel-pooled summary of the
     input (C7): x is compressed dim -> dim/k before the gate matmul, so V is
     (dim/k) x mlp_dim instead of dim x mlp_dim. The activated branch W1 still
     sees the full input. Tests whether the gate needs fine-grained per-channel
     info or only a compressed summary.
+
+    gate_act applies a nonlinearity to the gate branch: 'linear' (default) is the
+    standard SwiGLU signed/unbounded gate; 'fast_sigmoid'/'sigmoid' make it a
+    bounded 0-1 'whether-on' valve (the transistor-style division of labor).
     """
 
     def __init__(self, dim: int, mlp_dim: int, activation: nn.Module,
-                 gate_pool: int = 1, gate_pool_type: str = "mean"):
+                 gate_pool: int = 1, gate_pool_type: str = "mean", gate_act: str = "linear"):
         super().__init__()
         self.fc1 = nn.Linear(dim, mlp_dim, bias=False)
         if gate_pool > 1:
@@ -300,12 +324,14 @@ class GatedMLP(nn.Module):
             self.fc_gate = nn.Linear(dim, mlp_dim, bias=False)
         self.fc2 = nn.Linear(mlp_dim, dim, bias=False)
         self.act = activation
+        self.gate_act = gate_act
         self._capture_dead = False
         self._last_dead_frac: float | None = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_in = self.gate_pool(x) if self.gate_pool is not None else x
-        h = self.act(self.fc1(x)) * self.fc_gate(gate_in)
+        gate = apply_gate_act(self.fc_gate(gate_in), self.gate_act)
+        h = self.act(self.fc1(x)) * gate
         if self._capture_dead:
             with torch.no_grad():
                 self._last_dead_frac = (h.abs() < _DEAD_THRESHOLD).float().mean().item()
@@ -314,13 +340,15 @@ class GatedMLP(nn.Module):
 
 def make_mlp(dim: int, model_dim: int, act_name: str, act_init: str,
              gate_pool: int = 1, gate_pool_type: str = "mean",
-             act_slope: float = 0.0, act_shift: float = 0.0, act_curv: float = 1.0) -> nn.Module:
+             act_slope: float = 0.0, act_shift: float = 0.0, act_curv: float = 1.0,
+             gate_act: str = "linear") -> nn.Module:
     """Build an MLP block. Hidden dim chosen to match params: 4d for standard, (8/3)d for gated."""
     act = make_activation(act_name, act_init, act_slope=act_slope, act_shift=act_shift, act_curv=act_curv)
     if act_name in GATED_ACTIVATIONS:
         # 8/3 * d, rounded to nearest multiple of 64 for hardware-friendliness
         hidden = max(64, round(8 * model_dim / 3 / 64) * 64)
-        return GatedMLP(dim, hidden, act, gate_pool=gate_pool, gate_pool_type=gate_pool_type)
+        return GatedMLP(dim, hidden, act, gate_pool=gate_pool, gate_pool_type=gate_pool_type,
+                        gate_act=gate_act)
     else:
         hidden = 4 * model_dim
         return MLP(dim, hidden, act)
@@ -328,14 +356,16 @@ def make_mlp(dim: int, model_dim: int, act_name: str, act_init: str,
 
 class Block(nn.Module):
     def __init__(self, dim, num_heads, model_dim, act_name, act_init,
-                 gate_pool=1, gate_pool_type="mean", act_slope=0.0, act_shift=0.0, act_curv=1.0):
+                 gate_pool=1, gate_pool_type="mean", act_slope=0.0, act_shift=0.0, act_curv=1.0,
+                 gate_act="linear"):
         super().__init__()
         self.ln1 = nn.LayerNorm(dim)
         self.attn = CausalSelfAttention(dim, num_heads)
         self.ln2 = nn.LayerNorm(dim)
         self.mlp = make_mlp(dim, model_dim, act_name, act_init,
                             gate_pool=gate_pool, gate_pool_type=gate_pool_type,
-                            act_slope=act_slope, act_shift=act_shift, act_curv=act_curv)
+                            act_slope=act_slope, act_shift=act_shift, act_curv=act_curv,
+                            gate_act=gate_act)
 
     def forward(self, x):
         x = x + self.attn(self.ln1(x))
@@ -345,7 +375,8 @@ class Block(nn.Module):
 
 class TinyGPT(nn.Module):
     def __init__(self, vocab_size, num_layers, dim, num_heads, seq_len, act_name, act_init,
-                 gate_pool=1, gate_pool_type="mean", act_slope=0.0, act_shift=0.0, act_curv=1.0):
+                 gate_pool=1, gate_pool_type="mean", act_slope=0.0, act_shift=0.0, act_curv=1.0,
+                 gate_act="linear"):
         super().__init__()
         self.token_embed = nn.Embedding(vocab_size, dim)
         self.pos_embed = nn.Embedding(seq_len, dim)
@@ -353,7 +384,8 @@ class TinyGPT(nn.Module):
         self.blocks = nn.ModuleList([
             Block(dim, num_heads, dim, act_name, act_init,
                   gate_pool=gate_pool, gate_pool_type=gate_pool_type,
-                  act_slope=act_slope, act_shift=act_shift, act_curv=act_curv)
+                  act_slope=act_slope, act_shift=act_shift, act_curv=act_curv,
+                  gate_act=gate_act)
             for _ in range(num_layers)
         ])
         self.ln_f = nn.LayerNorm(dim)
@@ -504,6 +536,7 @@ def train_one(config, train_data, val_data, seed, device):
         gate_pool_type=config.get("gate_pool_type", "mean"),
         act_slope=config.get("act_slope", 0.0),
         act_curv=config.get("act_curv", 1.0),
+        gate_act=config.get("gate_act", "linear"),
         act_shift=config.get("act_shift", 0.0),
     ).to(device)
 
@@ -648,6 +681,11 @@ def main():
                          "activation. With --act-slope 1 and a gated MLP, c=0.253 makes a "
                          "standard-normal input give unit-variance output. Affects relu2/reglu "
                          "and xabsx/xglu.")
+    ap.add_argument("--gate-act", type=str, default="linear",
+                    choices=["linear", "fast_sigmoid", "sigmoid"],
+                    help="nonlinearity on the gate branch of a gated MLP. linear = standard "
+                         "SwiGLU signed/unbounded gate; fast_sigmoid = cheap rational 0-1 valve "
+                         "(0.5*g/(1+|g|)+0.5); sigmoid = true 0-1 valve. Only affects gated activations.")
     args = ap.parse_args()
 
     if args.tiny:
@@ -663,6 +701,7 @@ def main():
     cfg_base["act_slope"] = args.act_slope
     cfg_base["act_shift"] = args.act_shift
     cfg_base["act_curv"] = args.act_curv
+    cfg_base["gate_act"] = args.gate_act
 
     device = pick_device(args.device)
     print(f"Device: {device}")
@@ -690,6 +729,8 @@ def main():
             key += f"_s{args.act_slope:g}t{args.act_shift:g}"
         if args.act_curv != 1.0:
             key += f"_c{args.act_curv:g}"
+        if args.gate_act != "linear":
+            key += f"_g{args.gate_act}"
         all_results[key] = []
         for seed in range(args.seeds):
             print(f"\n=== activation={act}  gate_pool={args.gate_pool}  seed={seed} ===")
