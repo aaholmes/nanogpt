@@ -49,6 +49,18 @@ def _nullctx():
 # -----------------------------------------------------------------------------
 # Activations
 
+class EluQuad(nn.Module):
+    """Dense, C1, slope-1 activation -- a non-sparse ReLU2 with a bounded ELU-like tail:
+        x >= 0:  x + x^2     (sloped-ReLU2 positive branch; slope 1 at the origin)
+        x <  0:  x/(1-x)     (= 1/(1-x)-1; softsign-like, saturates to -1; slope 1 at 0)
+    C1 at the origin (value and slope match). No zeros -> dense activations, which Muon
+    handles better than ReLU2's sparsity; bounded below; cheap (one reciprocal, no exp)."""
+    def forward(self, x):
+        pos = F.relu(x)
+        neg = x - pos                      # = min(x, 0) <= 0, so 1 - neg >= 1 (no div-by-zero)
+        return pos + pos * pos + neg / (1.0 - neg)
+
+
 class ReLU2(nn.Module):
     """Squared ReLU, optionally shifted and given a nonzero initial slope:
 
@@ -207,6 +219,8 @@ def make_activation(name: str, init: str = "gelu_minimax",
         # No activation: gated MLP becomes (W1 x) * (W2 x) -- Shazeer's Bilinear.
         # The nonlinearity is purely the multiplicative gate. Cheapest gated variant.
         return nn.Identity()
+    if name == "eluquad":
+        return EluQuad()
     raise ValueError(f"Unknown activation: {name}")
 
 
@@ -809,7 +823,7 @@ CONFIGS = {
 
 
 ALL_ACTIVATIONS = ["relu2", "gelu", "trilu_sym", "trilu_asym", "swiglu", "geglu", "triglu",
-                   "xabsx", "xglu", "reglu", "bilinear"]
+                   "xabsx", "xglu", "reglu", "bilinear", "eluquad"]
 
 # Default 7-activation sweep covering the standard/gated x ReLU-like/GELU-like/TriLU comparison,
 # plus xglu (gated x|x|) which tests using the negative half of the input distribution.
@@ -822,6 +836,9 @@ def main():
     ap.add_argument("--config", choices=list(CONFIGS), default="default")
     ap.add_argument("--tiny", action="store_true", help="alias for --config tiny")
     ap.add_argument("--seeds", type=int, default=3)
+    ap.add_argument("--seed-start", type=int, default=0,
+                    help="first seed index (run indices seed_start .. seed_start+seeds-1). Lets a "
+                         "sweep loop seeds OUTER / variants INNER for early tentative comparison.")
     ap.add_argument("--steps", type=int, default=None, help="override total_steps")
     ap.add_argument("--batch-size", type=int, default=None, help="override batch_size")
     ap.add_argument("--activations", type=str, default=",".join(DEFAULT_ACTIVATIONS),
@@ -942,7 +959,7 @@ def main():
         if args.optimizer != "adamw":
             key += f"_{args.optimizer}"
         all_results[key] = []
-        for seed in range(args.seeds):
+        for seed in range(args.seed_start, args.seed_start + args.seeds):
             print(f"\n=== activation={act}  gate_pool={args.gate_pool}  seed={seed} ===")
             log = train_one(cfg, train_data, val_data, seed, device)
             all_results[key].append(log)
