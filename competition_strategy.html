@@ -37,6 +37,9 @@
   .muted { color: var(--muted); font-size: 0.9em; }
   .formula { font-family: "STIX Two Math", "Cambria Math", serif; font-style: italic; }
   ul { padding-left: 1.4em; } li { margin: 0.25em 0; }
+  figure { margin: 1.1em 0 0.4em; }
+  figure img { max-width: 100%; height: auto; display: block; margin: 0 auto; border: 1px solid var(--border); border-radius: 4px; }
+  figcaption { text-align: center; color: var(--muted); font-size: 0.85em; margin-top: 0.5em; }
   .footer { margin-top: 2.5em; padding-top: 1em; border-top: 1px solid var(--border); color: var(--muted); font-size: 0.85em; }
 </style>
 </head>
@@ -87,6 +90,7 @@
 <table>
 <tr><th>Variant (Muon, 124M)</th><th>MLP</th><th>Val loss</th><th>vs ReLU&sup2;</th></tr>
 <tr><td><strong>relu2_s1</strong> &mdash; sloped ReLU&sup2; <span class="formula">x+x&sup2;</span></td><td>standard</td><td class="n"><strong>5.699</strong></td><td>&minus;0.057 (p=0.19)</td></tr>
+<tr><td>eluquad &mdash; dense <span class="formula">x+x&sup2;</span> / <span class="formula">x/(1&minus;x)</span></td><td>standard</td><td class="n">5.712</td><td>&minus;0.044 (p&asymp;0.11)</td></tr>
 <tr><td>relu2 (incumbent)</td><td>standard</td><td class="n">5.756</td><td>baseline</td></tr>
 <tr><td>xglu (<span class="formula">x|x|</span>)</td><td>gated</td><td class="n">5.854</td><td>+0.098 (p=0.024)</td></tr>
 <tr><td>bilinear</td><td>gated</td><td class="n">5.859</td><td>+0.103 (p=0.025)</td></tr>
@@ -97,7 +101,33 @@
 <strong>Gating reverses from a win to a significant loss.</strong> Under AdamW gating <em>beat</em> standard ReLU&sup2; by ~0.09; at 124M under Muon all four gated variants are <strong>0.10&ndash;0.16 worse, each p&lt;0.05</strong>. The gap even <em>grew</em> with scale (it was a tie at our 51M pilot), so at the real size gating is more clearly wrong, not less &mdash; and it also costs more (three matmuls vs two). Doubly ruled out for a record. <span class="muted">(LR is load-bearing: a coarse-LR pilot showed reglu "collapsing" at +0.18; per-variant tuning shrank that, but the ~0.10 gated penalty above is real and significant <em>with</em> tuned LRs at 124M.)</span>
 </div>
 <div class="good">
-<strong>The best variant is a same-cost standard MLP.</strong> <code>relu2_s1</code> &mdash; squared-ReLU with a linear floor at the origin, <span class="formula">ReLU(x)&sup2;+ReLU(x)</span>, fixing ReLU&sup2;'s gradient-starved start &mdash; tops the table. On final loss it is &minus;0.057 (p=0.19, not yet significant), but on the <em>benchmark-relevant</em> metric &mdash; steps to reach a target loss &mdash; it is consistently ~10% faster <em>and far more stable</em>: it hits val 5.9 at 2800&ndash;2900 steps on every seed, vs ReLU&sup2;'s 2800&ndash;3400. Same 2-matmul cost, transcendental-free, fusable &mdash; a genuine drop-in candidate, worth more seeds (to push significance) and a rented-H100 check. <span class="muted">(A dense variant, <code>eluquad</code>, testing whether removing ReLU&sup2;'s sparsity adds anything on top of the slope floor, is running now.)</span>
+<strong>The leaders are same-cost standard MLPs.</strong> The top two are both 2-matmul standard MLPs that fix ReLU&sup2;'s gradient-starved origin:
+<ul>
+<li><code>relu2_s1</code> &mdash; squared-ReLU with a linear floor, <span class="formula">ReLU(x)&sup2;+ReLU(x)</span>. On final loss &minus;0.057 vs the incumbent (p=0.19, not yet significant), but on the <em>benchmark-relevant</em> metric &mdash; steps to reach a target loss &mdash; consistently ~10% faster <em>and far more stable</em> (hits val 5.9 at 2800&ndash;2900 steps every seed, vs ReLU&sup2;'s 2800&ndash;3400).</li>
+<li><code>eluquad</code> &mdash; the <em>dense</em> cousin: same <span class="formula">x+x&sup2;</span> for x&ge;0, but a smooth saturating tail <span class="formula">x/(1&minus;x)</span> for x&lt;0 instead of a hard zero. Removing ReLU&sup2;'s sparsity matches relu2_s1 within noise (&minus;0.044 vs incumbent) &mdash; mild evidence that, for a <em>standard</em> MLP, fixing the origin matters more than sparsity does.</li>
+</ul>
+Both are transcendental-free and fusable &mdash; genuine drop-in candidates, the only directions with record upside.
+</div>
+<div class="box">
+<strong>What's running now: a powered LR-robustness grid.</strong> The leads above each came from a single-seed, short-horizon learning-rate probe, so a slightly-mis-tuned LR could be confounding small gaps. We are re-running the standard-MLP contenders as a shared learning-rate grid (multiple LRs &times; many seeds) to (a) reach significance and (b) confirm the ranking is stable across the LR neighborhood, not an artifact of where each variant's LR landed. The grid also screens two principled newcomers:
+<ul>
+<li><code>sniqu</code> (<em>Self-Normalizing Inverse-and-Quadratic Union</em>) &mdash; <code>eluquad</code> given the <strong>SELU treatment</strong>: rescaled and shifted to be exactly zero-mean / unit-variance under Gaussian input, fixing the ~1.8&times; residual-stream inflation raw eluquad causes. Keeps the quadratic curvature. (Motivation, derivation, and shape below.)</li>
+<li><code>selu</code> &mdash; the textbook self-normalizing activation, as a baseline. It is near-<em>linear</em> on the positive side, so <code>selu</code> vs <code>sniqu</code> isolates whether the quadratic curvature helps or hurts once both are moment-matched.</li>
+</ul>
+<span class="muted">Results pending; this section will be updated when the grid completes.</span>
+</div>
+
+<div class="box">
+<strong>Deriving <code>sniqu</code> &mdash; the Self-Normalizing Inverse-and-Quadratic Union.</strong>
+<p><strong>Motivation.</strong> <code>eluquad</code> matches the best standard MLP, but it is not <em>scale-controlled</em>. For a standard-normal input <span class="formula">x &sim; N(0,1)</span>, its output has mean <span class="formula">&asymp; 0.71</span> and variance <span class="formula">&asymp; 3.19</span> &mdash; so every MLP layer multiplies the residual-stream scale by <span class="formula">&radic;3.19 &asymp; 1.8&times;</span> and adds a constant offset, which the following RMSNorm then has to spend capacity undoing. This matters more under <strong>Muon</strong> than under Adam: Muon orthogonalizes each weight-matrix update, and a non-zero activation mean injects a rank-1 "DC" direction into the activation matrix that orthogonalization treats as genuine signal, degrading conditioning. The fix is the idea behind <strong>SELU</strong>: choose the activation's free constants so that a unit-Gaussian input maps to a zero-mean, unit-variance output (a self-normalizing fixed point on the first two moments).</p>
+<p><strong>Derivation.</strong> Let <span class="formula">h(x)</span> be the raw eluquad shape (<span class="formula">x+x&sup2;</span> for <span class="formula">x&ge;0</span>, <span class="formula">x/(1&minus;x)</span> for <span class="formula">x&lt;0</span>). Compute its first two moments under <span class="formula">x &sim; N(0,1)</span> by Gauss&ndash;Hermite quadrature: <span class="formula">&mu; = E[h] = 0.706</span>, <span class="formula">&sigma;&sup2; = Var[h] = 3.188</span>. Then define an affine output transform with shift <span class="formula">&beta;</span> and scale <span class="formula">&lambda;</span>:</p>
+<p style="text-align:center"><span class="formula">sniqu(x) = &lambda;&thinsp;(h(x) &minus; &beta;),&nbsp;&nbsp;&nbsp; &beta; = &mu; = 0.706,&nbsp;&nbsp; &lambda; = 1/&sigma; = 1/1.786 = 0.560.</span></p>
+<p>By construction this gives exactly <span class="formula">E[sniqu] = 0</span> and <span class="formula">Var[sniqu] = 1</span> (verified numerically). Two free parameters (scale, shift) pinned by two moment constraints &mdash; structurally the same recipe SELU uses to fix its <span class="formula">(&lambda;, &alpha;)</span>, except SELU tunes the negative-branch <em>depth</em> and keeps <span class="formula">g(0)=0</span>, whereas we keep eluquad's exact shape and add a DC offset (so <span class="formula">sniqu(0) = &minus;&lambda;&beta; &asymp; &minus;0.40</span>, deliberately cancelling the positive-mean bias).</p>
+<p><strong>What it keeps &mdash; and what it can't.</strong> It inherits eluquad's <span class="formula">C&sup2;</span> smoothness (matched value, slope, and curvature at the origin &mdash; no derivative jump like ReLU&sup2;, no kink like SELU) and its cost (one reciprocal, no transcendental). But it is only <em>moment-2</em> normalized, not Gaussian: the quadratic branch makes it irreducibly heavy-tailed (excess kurtosis <span class="formula">&asymp; 10</span> even after normalization), whereas near-linear SELU is close to Gaussian. That residual non-Gaussianity is exactly the curvature we suspect helps &mdash; and the <code>selu</code>-vs-<code>sniqu</code> contrast is designed to test whether it does.</p>
+<figure>
+<img src="sniqu.png" alt="sniqu compared with eluquad, ReLU-squared, and SELU: activation and derivative">
+<figcaption>sniqu (red) is eluquad (blue) rescaled to unit variance and shifted to zero mean. It has a dense negative tail (unlike ReLU&sup2;, flat for x&lt;0), a curved positive branch (unlike near-linear SELU), and a smooth derivative through the origin (unlike both).</figcaption>
+</figure>
 </div>
 
 <h2>6. Why an optimizer reorders activations</h2>

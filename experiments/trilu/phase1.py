@@ -61,6 +61,24 @@ class EluQuad(nn.Module):
         return pos + pos * pos + neg / (1.0 - neg)
 
 
+class EluQuadSN(nn.Module):
+    """eluquad given SELU's treatment: scale+shift the same C2 shape so that, for
+    x ~ N(0,1), the OUTPUT is zero-mean and unit-variance (a self-normalizing fixed
+    point on the first two moments, like SELU's lambda/alpha -- here lambda/beta).
+    Constants from Gauss-Hermite quadrature: E[h]=0.70638, Var[h]=3.18830.
+        g(x) = LAM * (eluquad(x) - BETA),  BETA=0.70638, LAM=1/sqrt(3.18830)=0.56004
+    Keeps eluquad's curvature (still leptokurtic, excess kurtosis ~10 -- positive
+    curvature can't be Gaussianized); only fixes scale+mean so the activation stops
+    inflating the residual stream ~1.8x and injecting a mean the norm must undo."""
+    BETA = 0.70638
+    LAM = 0.56004
+    def forward(self, x):
+        pos = F.relu(x)
+        neg = x - pos
+        h = pos + pos * pos + neg / (1.0 - neg)
+        return self.LAM * (h - self.BETA)
+
+
 class ReLU2(nn.Module):
     """Squared ReLU, optionally shifted and given a nonzero initial slope:
 
@@ -221,6 +239,10 @@ def make_activation(name: str, init: str = "gelu_minimax",
         return nn.Identity()
     if name == "eluquad":
         return EluQuad()
+    if name in ("eluquad_sn", "sniqu"):   # sniqu = Self-Normalizing Inverse-and-Quadratic Union
+        return EluQuadSN()
+    if name == "selu":
+        return nn.SELU()
     raise ValueError(f"Unknown activation: {name}")
 
 
@@ -823,7 +845,7 @@ CONFIGS = {
 
 
 ALL_ACTIVATIONS = ["relu2", "gelu", "trilu_sym", "trilu_asym", "swiglu", "geglu", "triglu",
-                   "xabsx", "xglu", "reglu", "bilinear", "eluquad"]
+                   "xabsx", "xglu", "reglu", "bilinear", "eluquad", "eluquad_sn", "sniqu", "selu"]
 
 # Default 7-activation sweep covering the standard/gated x ReLU-like/GELU-like/TriLU comparison,
 # plus xglu (gated x|x|) which tests using the negative half of the input distribution.
