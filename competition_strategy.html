@@ -83,16 +83,21 @@
 </div>
 
 <h2>5. The headline: it reverses under Muon</h2>
-<p>The benchmark uses Muon, so we re-ran the key comparison under it (medium scale, each variant at its own tuned learning rate; the faithful 124M + Polar-Express version is the run now in progress):</p>
+<p>The benchmark uses Muon, so the decisive comparison is under it. At the faithful <strong>124M (nanogpt-small) scale with the real Polar-Express orthogonalizer</strong>, 4 seeds &times; 4000 steps, each variant at its own parabola-tuned learning rate:</p>
 <table>
-<tr><th>Variant (Muon)</th><th>Val loss</th><th>vs standard ReLU&sup2;</th></tr>
-<tr><td>relu2 (standard)</td><td class="n">6.20</td><td>baseline</td></tr>
-<tr><td>xglu (gated <span class="formula">x|x|</span>)</td><td class="n">6.18</td><td>tie (p=0.25)</td></tr>
-<tr><td>reglu (gated ReLU&sup2;)</td><td class="n">~6.20</td><td>tie (after LR tuning&dagger;)</td></tr>
+<tr><th>Variant (Muon, 124M)</th><th>MLP</th><th>Val loss</th><th>vs ReLU&sup2;</th></tr>
+<tr><td><strong>relu2_s1</strong> &mdash; sloped ReLU&sup2; <span class="formula">x+x&sup2;</span></td><td>standard</td><td class="n"><strong>5.699</strong></td><td>&minus;0.057 (p=0.19)</td></tr>
+<tr><td>relu2 (incumbent)</td><td>standard</td><td class="n">5.756</td><td>baseline</td></tr>
+<tr><td>xglu (<span class="formula">x|x|</span>)</td><td>gated</td><td class="n">5.854</td><td>+0.098 (p=0.024)</td></tr>
+<tr><td>bilinear</td><td>gated</td><td class="n">5.859</td><td>+0.103 (p=0.025)</td></tr>
+<tr><td>reglu (ReLU&sup2;)</td><td>gated</td><td class="n">5.860</td><td>+0.104 (p=0.042)</td></tr>
+<tr><td>dquad</td><td>gated</td><td class="n">5.918</td><td>+0.162 (p=0.014)</td></tr>
 </table>
 <div class="warn">
-<strong>Gating's advantage does not survive Muon.</strong> The ~0.09 win under AdamW shrinks to a <em>tie</em>: the best gated variant only matches the standard ReLU&sup2; MLP. Since a gated MLP costs more (three matmuls vs two), a tie is a net loss on wall-clock — so <strong>the gated direction is not record-worthy under the real optimizer.</strong> The cheap local test reached this conclusion for ~$0, before spending on rented hardware.<br>
-<span class="muted">&dagger; An earlier coarse run showed reglu "collapsing" (+0.18); that was largely learning-rate mis-tuning — with a properly tuned LR the gap is ~0 (not significant). Tuning each variant's LR is essential to a fair comparison.</span>
+<strong>Gating reverses from a win to a significant loss.</strong> Under AdamW gating <em>beat</em> standard ReLU&sup2; by ~0.09; at 124M under Muon all four gated variants are <strong>0.10&ndash;0.16 worse, each p&lt;0.05</strong>. The gap even <em>grew</em> with scale (it was a tie at our 51M pilot), so at the real size gating is more clearly wrong, not less &mdash; and it also costs more (three matmuls vs two). Doubly ruled out for a record. <span class="muted">(LR is load-bearing: a coarse-LR pilot showed reglu "collapsing" at +0.18; per-variant tuning shrank that, but the ~0.10 gated penalty above is real and significant <em>with</em> tuned LRs at 124M.)</span>
+</div>
+<div class="good">
+<strong>The best variant is a same-cost standard MLP.</strong> <code>relu2_s1</code> &mdash; squared-ReLU with a linear floor at the origin, <span class="formula">ReLU(x)&sup2;+ReLU(x)</span>, fixing ReLU&sup2;'s gradient-starved start &mdash; tops the table. On final loss it is &minus;0.057 (p=0.19, not yet significant), but on the <em>benchmark-relevant</em> metric &mdash; steps to reach a target loss &mdash; it is consistently ~10% faster <em>and far more stable</em>: it hits val 5.9 at 2800&ndash;2900 steps on every seed, vs ReLU&sup2;'s 2800&ndash;3400. Same 2-matmul cost, transcendental-free, fusable &mdash; a genuine drop-in candidate, worth more seeds (to push significance) and a rented-H100 check. <span class="muted">(A dense variant, <code>eluquad</code>, testing whether removing ReLU&sup2;'s sparsity adds anything on top of the slope floor, is running now.)</span>
 </div>
 
 <h2>6. Why an optimizer reorders activations</h2>
@@ -105,8 +110,9 @@
 
 <h2>7. Where this leaves the project</h2>
 <ul>
-<li><strong>Record hunt (via activations): unlikely.</strong> Under Muon the best gated MLP only ties the incumbent ReLU&sup2; while costing more. We will not spend rented-H100 budget chasing it.</li>
-<li><strong>The deliverable is the study:</strong> <em>"Activation-function rankings are optimizer-dependent: Adam-era choices need not transfer to Muon."</em> This is a genuine, largely-unexamined gap and a stronger portfolio piece than a marginal record. A <strong>faithful study is running now</strong> at 124M (nanogpt-small scale) with Muon + Polar Express, re-establishing every comparison cleanly.</li>
+<li><strong>Gating: ruled out.</strong> Under Muon at 124M every gated MLP is significantly worse than the incumbent ReLU&sup2; <em>and</em> costs more. No rented-H100 budget goes here.</li>
+<li><strong>One live record candidate:</strong> <code>relu2_s1</code> (sloped ReLU&sup2;) &mdash; a same-cost standard MLP that reaches target ~10% faster and far more stably. Worth a confirming multi-seed + rented-H100 run; this is the only direction with record upside.</li>
+<li><strong>The deliverable is the study:</strong> <em>"Activation-function rankings are optimizer-dependent: Adam-era choices need not transfer to Muon."</em> A genuine, largely-unexamined gap and a stronger portfolio piece than a marginal record &mdash; now established cleanly at 124M (nanogpt-small scale) under Muon + Polar Express, with the gating reversal significant at the real scale.</li>
 <li><strong>To make it a paper</strong> would additionally need: multiple model scales, per-optimizer hyperparameter co-tuning (started — the LR correction above shows why), disentangling activation shape from MLP structure, and testing generality across the orthogonalizing-optimizer family.</li>
 </ul>
 
