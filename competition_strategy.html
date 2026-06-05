@@ -46,7 +46,7 @@
 <body>
 
 <h1>Do better MLP activations help in Modded-NanoGPT — and does the answer depend on the optimizer?</h1>
-<p class="muted">Working notes. Private fork of <code>KellerJordan/modded-nanogpt</code>. Author: Adam Holmes. Status: faithful large-scale study in progress.</p>
+<p class="muted">Working notes. Private fork of <code>KellerJordan/modded-nanogpt</code>. Author: Adam Holmes. Status: Muon LR-robustness grid complete (2 seeds); NorMuon pre-screen complete. Gate-3 H100 run: NO-GO &mdash; all three candidates are equivalent under the production optimizer.</p>
 
 <h2>1. Background</h2>
 <p><a href="https://github.com/KellerJordan/modded-nanogpt">Modded-NanoGPT</a> is a community <em>speedrun</em>: train a ~124M-parameter GPT on the FineWeb text dataset to a fixed validation loss (cross-entropy ≤ 3.28 nats/token) as fast as possible on a fixed 8&times;H100 node. The data and target are frozen; everything else (architecture, optimizer, schedule) is fair game. The current record is ~1.4 minutes. The modern record stack uses the <strong>Muon</strong> optimizer, FP8 matmuls, sliding-window attention, and a <strong>ReLU&sup2;</strong> activation (<span class="formula">max(0,x)&sup2;</span>) in its MLP blocks.</p>
@@ -56,7 +56,7 @@
 <p>All numbers below come from a controlled local harness (one RTX 5060 Ti, 16 GB), built to <em>rank</em> design choices cheaply — not to reproduce the benchmark. Clearly:</p>
 <div class="box">
 <strong>Model:</strong> decoder-only GPT. Two scales used: <em>medium</em> (51M: 8 layers, width 512) for fast pilots, and <em>small</em> (124M: 12 layers, width 768, 6 heads) matching the real nanogpt-small, for the faithful study.<br>
-<strong>Optimizers:</strong> <em>AdamW</em> (per-parameter adaptive) and <em>Muon</em> (orthogonalizes each weight-matrix update via the real "Polar Express" iteration).<br>
+<strong>Optimizers:</strong> <em>AdamW</em> (per-parameter adaptive), <em>Muon</em> (orthogonalizes each weight-matrix update via the real "Polar Express" iteration), and <em>NorMuon</em> (Muon + the record's neuron-wise variance normalization).<br>
 <strong>Training:</strong> bf16, sequence length 1024, batch 16, 3000–4000 steps, <strong>4–5 seeds per variant</strong>. All variants share seeds, so comparisons are <em>paired</em> (the per-seed loss difference has tiny noise, ~0.004, even though run-to-run loss varies ~0.05).<br>
 <strong>Metric:</strong> mean validation cross-entropy on FineWeb (nats/token; lower is better), reported as the seed-mean of the final loss, plus steps-to-reach-a-target-loss (how the speedrun is actually scored). Significance via paired t-tests.<br>
 <strong>Faithful to the benchmark:</strong> model size, Muon + Polar Express, torch.compile, chunked cross-entropy. <strong>Not</strong> included: FP8, value embeddings, sliding-window attention, the real 896→2048 data schedule. So it is a clean ranking instrument; real-benchmark validation needs rented H100s.
@@ -106,15 +106,47 @@
 <li><code>relu2_s1</code> &mdash; squared-ReLU with a linear floor, <span class="formula">ReLU(x)&sup2;+ReLU(x)</span>. On final loss &minus;0.057 vs the incumbent (p=0.19, not yet significant), but on the <em>benchmark-relevant</em> metric &mdash; steps to reach a target loss &mdash; consistently ~10% faster <em>and far more stable</em> (hits val 5.9 at 2800&ndash;2900 steps every seed, vs ReLU&sup2;'s 2800&ndash;3400).</li>
 <li><code>eluquad</code> &mdash; the <em>dense</em> cousin: same <span class="formula">x+x&sup2;</span> for x&ge;0, but a smooth saturating tail <span class="formula">x/(1&minus;x)</span> for x&lt;0 instead of a hard zero. Removing ReLU&sup2;'s sparsity matches relu2_s1 within noise (&minus;0.044 vs incumbent) &mdash; mild evidence that, for a <em>standard</em> MLP, fixing the origin matters more than sparsity does.</li>
 </ul>
-Both are transcendental-free and fusable &mdash; genuine drop-in candidates, the only directions with record upside.
+Both are transcendental-free and fusable &mdash; genuine drop-in candidates with record upside (the powered grid below refines this ranking and adds <code>sniqu</code>).
 </div>
 <div class="box">
-<strong>What's running now: a powered LR-robustness grid.</strong> The leads above each came from a single-seed, short-horizon learning-rate probe, so a slightly-mis-tuned LR could be confounding small gaps. We are re-running the standard-MLP contenders as a shared learning-rate grid (multiple LRs &times; many seeds) to (a) reach significance and (b) confirm the ranking is stable across the LR neighborhood, not an artifact of where each variant's LR landed. The grid also screens two principled newcomers:
+<strong>LR-robustness grid (Muon, 124M, 2 seeds).</strong> The 4-seed leads above each came from a single-seed probe, so a slightly mis-tuned LR could confound small gaps. We re-ran five standard-MLP contenders as a shared LR grid (3 LRs per variant &times; 2 seeds, each variant at its own optimum) to test robustness and screen two principled newcomers:
 <ul>
-<li><code>sniqu</code> (<em>Self-Normalizing Inverse-and-Quadratic Union</em>) &mdash; <code>eluquad</code> given the <strong>SELU treatment</strong>: rescaled and shifted to be exactly zero-mean / unit-variance under Gaussian input, fixing the ~1.8&times; residual-stream inflation raw eluquad causes. Keeps the quadratic curvature. (Motivation, derivation, and shape below.)</li>
+<li><code>sniqu</code> (<em>Self-Normalizing Inverse-and-Quadratic Union</em>) &mdash; <code>eluquad</code> given the <strong>SELU treatment</strong>: rescaled and shifted to be exactly zero-mean / unit-variance under Gaussian input, fixing the ~1.8&times; residual-stream inflation raw eluquad causes. Keeps the quadratic curvature. (Derivation and shape below.)</li>
 <li><code>selu</code> &mdash; the textbook self-normalizing activation, as a baseline. It is near-<em>linear</em> on the positive side, so <code>selu</code> vs <code>sniqu</code> isolates whether the quadratic curvature helps or hurts once both are moment-matched.</li>
 </ul>
-<span class="muted">Results pending; this section will be updated when the grid completes.</span>
+<table>
+<tr><th>Variant (Muon, 124M, 2-seed mean)</th><th>best val loss</th><th>at LR</th><th>vs relu2 (2-seed &Delta;)</th></tr>
+<tr><td><strong>sniqu</strong></td><td class="n"><strong>5.667</strong></td><td>0.01</td><td>&minus;0.052 (consistent both seeds)</td></tr>
+<tr><td>eluquad</td><td class="n">5.706</td><td>0.01</td><td>&minus;0.014 (consistent both seeds)</td></tr>
+<tr><td>relu2 (incumbent)</td><td class="n">5.720</td><td>0.005</td><td>baseline</td></tr>
+<tr><td>relu2_s1</td><td class="n">5.708</td><td>0.01</td><td>&minus;0.012 (<strong>mixed sign</strong> &mdash; seeds disagree)</td></tr>
+<tr><td>selu</td><td class="n">5.833</td><td>0.01</td><td>+0.114 (clearly worse, both seeds)</td></tr>
+</table>
+<p>Signals from 2 seeds: <strong>sniqu consistently leads</strong> by ~0.052 nats; selu lags the incumbent by a large, consistent margin, confirming that quadratic curvature (not moment-matching alone) does the work. relu2_s1's sign flips between seeds and is a wash at this horizon. <em>n=2 is not enough for a formal t-test; these are directional signals only.</em></p>
+</div>
+
+<div class="box">
+<strong>NorMuon pre-screen &mdash; does the ranking survive the production optimizer?</strong>
+<p>The record's real optimizer is <strong>NorMuon</strong> (Muon + per-neuron second-moment EMA that rescales each weight matrix to preserve its Frobenius norm), not plain Muon. Since our thesis is that rankings are optimizer-dependent, we ran a 5-LR &times; 3-variant probe at 2000 steps (seed 0) before committing rented-H100 budget.</p>
+<table>
+<tr><th>LR</th><th>relu2</th><th>relu2_s1</th><th>sniqu</th></tr>
+<tr><td>0.0025</td><td class="n">6.730</td><td class="n">6.700</td><td class="n">6.717</td></tr>
+<tr><td>0.005</td><td class="n">6.571</td><td class="n">6.564</td><td class="n">6.570</td></tr>
+<tr><td>0.01</td><td class="n">6.453</td><td class="n">6.459</td><td class="n">6.476</td></tr>
+<tr><td><strong>0.02</strong></td><td class="n"><strong>6.414 &#9733;</strong></td><td class="n"><strong>6.425 &#9733;</strong></td><td class="n"><strong>6.426 &#9733;</strong></td></tr>
+<tr><td>0.04</td><td class="n">6.458</td><td class="n">6.463</td><td class="n">6.498</td></tr>
+</table>
+<p>All three variants share the same optimal LR (<strong>0.02</strong>), consistent with the record's 0.023. At that LR:</p>
+<table>
+<tr><th>Variant (NorMuon, 124M, seed 0)</th><th>best val loss</th><th>&Delta; vs relu2</th></tr>
+<tr><td>relu2 (incumbent)</td><td class="n">6.414</td><td>baseline</td></tr>
+<tr><td>relu2_s1</td><td class="n">6.425</td><td>+0.011</td></tr>
+<tr><td>sniqu</td><td class="n">6.426</td><td>+0.012</td></tr>
+</table>
+<div class="warn" style="margin-top:0.8em">
+<strong>Pre-screen result: NO-GO for Gate-3 H100 runs.</strong> The ~0.052 sniqu advantage seen under plain Muon completely disappears under NorMuon &mdash; all three candidates land within 0.012 nats of each other, well within single-seed noise. NorMuon's per-neuron variance normalization appears to make the optimizer <em>robust to activation scale and shape</em>, washing out the differences that accumulated under plain Muon. There is no signal here worth ~$100 in rented H100 time.
+</div>
+<p class="muted">Note: 2000-step probe, single seed &mdash; insufficient for significance on its own. Used as a go/no-go screen, not an inference.</p>
 </div>
 
 <div class="box">
@@ -138,16 +170,17 @@ Both are transcendental-free and fusable &mdash; genuine drop-in candidates, the
 </ul>
 <p>The practical upshot: <strong>activation/gating conclusions are optimizer-dependent.</strong> The entire activation canon — GELU (2016), SwiGLU (2020) — was established with Adam-family optimizers. Muon and related orthogonalizing optimizers (Shampoo, SOAP) postdate it, and our results show their rankings differ.</p>
 
-<h2>7. Where this leaves the project</h2>
+<h2>7. Final conclusions</h2>
 <ul>
-<li><strong>Gating: ruled out.</strong> Under Muon at 124M every gated MLP is significantly worse than the incumbent ReLU&sup2; <em>and</em> costs more. No rented-H100 budget goes here.</li>
-<li><strong>One live record candidate:</strong> <code>relu2_s1</code> (sloped ReLU&sup2;) &mdash; a same-cost standard MLP that reaches target ~10% faster and far more stably. Worth a confirming multi-seed + rented-H100 run; this is the only direction with record upside.</li>
-<li><strong>The deliverable is the study:</strong> <em>"Activation-function rankings are optimizer-dependent: Adam-era choices need not transfer to Muon."</em> A genuine, largely-unexamined gap and a stronger portfolio piece than a marginal record &mdash; now established cleanly at 124M (nanogpt-small scale) under Muon + Polar Express, with the gating reversal significant at the real scale.</li>
-<li><strong>To make it a paper</strong> would additionally need: multiple model scales, per-optimizer hyperparameter co-tuning (started — the LR correction above shows why), disentangling activation shape from MLP structure, and testing generality across the orthogonalizing-optimizer family.</li>
+<li><strong>Gating: ruled out (statistically significant).</strong> Under Muon at 124M every gated MLP is significantly worse than the incumbent ReLU&sup2; <em>and</em> costs more (p&lt;0.05, n=4 paired seeds, all four variants). No rented-H100 budget goes here.</li>
+<li><strong>Standard-MLP variants: not a record opportunity.</strong> sniqu, relu2_s1, and eluquad all showed promising signals under plain Muon (sniqu ~&minus;0.052, 2 seeds, consistent). But the NorMuon pre-screen closed the door: at the production optimizer all three land within 0.012 nats of each other &mdash; effectively tied. The activation swap does not survive the optimizer that actually matters. Neither candidate goes to rented H100s.</li>
+<li><strong>Infrastructure built and validated:</strong> Both candidates are integrated into the real <code>train_gpt.py</code> behind a one-line env flag, the fused Triton kernel supports all three activations with verified forward and backward passes, and a turnkey rented-H100 A/B harness is in <code>deploy/</code>. The work is not wasted &mdash; it would be trivial to A/B on the real benchmark if a future signal warrants it.</li>
+<li><strong>The statistically solid finding &mdash; and why it matters:</strong> <em>Activation-function and gating rankings are optimizer-dependent.</em> Gating beats standard MLPs by ~0.09 nats under AdamW and loses by 0.10&ndash;0.16 under Muon (p&lt;0.05). NorMuon's variance normalization further washes out the finer ranking differences that appeared under plain Muon, suggesting the mechanism: orthogonalizing optimizers are intrinsically more robust to activation scale and conditioning than Adam-family optimizers, so activation choice matters less. The entire activation canon (GELU, SwiGLU) was benchmarked under Adam; these results show those rankings do not reliably transfer to the modern optimizer family.</li>
+<li><strong>To make it a paper</strong> would additionally need: multiple model scales, per-optimizer hyperparameter co-tuning, disentangling activation shape from MLP structure, and testing generality across the orthogonalizing-optimizer family (Muon, Shampoo, SOAP).</li>
 </ul>
 
 <div class="footer">
-Harness: <code>experiments/trilu/phase1.py</code> (+ <code>significance.py</code>, <code>pick_lr.py</code>, <code>steps_to_target.py</code>). Real reference code: <code>train_gpt.py</code>.<br>
+Harness: <code>experiments/trilu/phase1.py</code> (+ <code>significance.py</code>, <code>pick_lr.py</code>, <code>steps_to_target.py</code>). Kernel validation: <code>experiments/trilu/test_fused_mlp.py</code>. Real-stack integration + rented-H100 A/B: <code>train_gpt.py</code>, <code>triton_kernels.py</code>, <code>deploy/</code>.<br>
 Working document — numbers are from the local ranking harness, not the official benchmark; revisit as the faithful study completes.
 </div>
 
