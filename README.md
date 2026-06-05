@@ -389,26 +389,50 @@ compared to Shampoo.
 
 ---
 
-## Fork: TriLU / TriGLU activation experiment
+## Fork: Activation function sweep — AdamW / Muon / NorMuon
 
-This fork is exploring a learnable piecewise-polynomial activation function family — **TriLU** (Three-piece Linear Unit) — as an alternative to ReLU². The activation has the form `f(x) = 0` for `x ≤ L`, a learnable quadratic for `L < x < R`, and `f(x) = x` for `x ≥ R`, with 2–3 per-layer learnable parameters. At the minimax GELU-fit init `(L, R, α) = (−1.91, 1.91, 0.247)` it tracks GELU within max abs error 0.053 / RMS 0.029, at roughly 2.5× ReLU²'s per-element op count (negligible inside a fused MLP kernel).
+This fork investigates whether the MLP activation choice matters in the speedrun, and whether the answer depends on the optimizer. Short answer: **rankings are optimizer-dependent, and the production optimizer (NorMuon) makes activation choice largely irrelevant.**
 
-**Core hypothesis:** ReLU² won this codebase on cost, not shape. A bounded GELU-shape activation at near-ReLU² cost should beat ReLU² on wallclock to the target loss.
+### What was tested
 
-**Gated variants:** `SwiGLU`, `GeGLU`, and the novel `TriGLU` (TriLU inside a gated MLP) are included in the Phase 1 comparison to disentangle the activation-shape question from the gating question.
+Two MLP structures × several activations, all at 124M (nanogpt-small scale), local harness (RTX 5060 Ti), faithful config (Muon + Polar Express, torch.compile, chunked cross-entropy):
 
-### Plan
+- **Standard MLP** (`W₂·act(W₁x)`): ReLU², relu2_s1 (`ReLU(x)²+ReLU(x)`), eluquad (`x+x²` / `x/(1−x)`), sniqu (eluquad self-normalized to zero mean / unit variance), SELU
+- **Gated MLP** (`W₃·[act(W₁x)⊙(W₂x)]`): xglu, bilinear, reglu, dquad
 
-- **Phase 1** (essentially free, local single-GPU): quality comparison of ReLU² / GELU / TriLU / SwiGLU / GeGLU / TriGLU at matched compute. 6 variants × 3 seeds × ~40 min ≈ 12 hr on RTX 5060 Ti.
-- **Phase 2** (~$50–100, single H100): fused `Linear → TriLU → Linear` Triton kernel; wallclock comparison vs the existing fused ReLU² kernel (record #59).
-- **Phase 3a** (Track 1 validation, ~$20–60): 8–15 trials at full Track 1 config.
-- **Phase 3b** (Track 2 validation, ~$60–160): port + `coordinate_descent_tuning` + schedule retune, submitted in close succession with the Track 1 PR.
+### Results
 
-Detailed strategy, rules analysis, conditional probabilities, and risks: [`competition_strategy.html`](competition_strategy.html).
+**Under AdamW (51M pilot, 5 seeds):** gating wins by ~0.09 nats. Every gated MLP beats every standard MLP. The square-law gate `x|x|` leads.
 
-Phase 1 harness: [`experiments/trilu/phase1.py`](experiments/trilu/phase1.py), plotter [`experiments/trilu/plot.py`](experiments/trilu/plot.py).
+**Under Muon at 124M (4 seeds, paired t-tests):** the ranking reverses.
 
-GELU-fit derivation (L² vs minimax): [`img/gelu_vs_variant4.png`](img/gelu_vs_variant4.png), [`img/gelu_fit_L2_vs_Linf.png`](img/gelu_fit_L2_vs_Linf.png).
+| Variant | vs ReLU² | p-value |
+|---------|----------|---------|
+| relu2_s1 | −0.057 | 0.19 (ns) |
+| eluquad | −0.044 | 0.11 (ns) |
+| **relu2 (incumbent)** | baseline | — |
+| xglu (gated) | +0.098 | **0.024** |
+| bilinear (gated) | +0.103 | **0.025** |
+| reglu (gated) | +0.104 | **0.042** |
+| dquad (gated) | +0.162 | **0.013** |
+
+All four gated variants are significantly worse than ReLU² under Muon (p<0.05). The ~0.09 AdamW gating advantage flips to a ~0.10–0.16 penalty. A 2-seed LR-robustness grid added `sniqu` (consistent −0.052 vs ReLU², not yet significant at n=2) and confirmed `selu` trails by +0.11.
+
+**Under NorMuon — the production optimizer (1 seed, 5-LR sweep, 2000 steps):**
+
+| LR | relu2 | relu2_s1 | sniqu |
+|----|-------|----------|-------|
+| 0.02 ★ | **6.414** | 6.425 (+0.011) | 6.426 (+0.012) |
+
+All three standard-MLP variants converge to the same optimal LR (0.02, consistent with the record's 0.023) and land within 0.012 nats of each other — indistinguishable within single-seed noise. The sniqu Muon advantage does not survive NorMuon.
+
+### Conclusion
+
+**Activation-function and gating rankings are optimizer-dependent.** The entire activation canon (GELU, SwiGLU) was established under Adam-family optimizers; these results show those rankings do not reliably transfer to Muon or NorMuon. NorMuon's per-neuron variance normalization appears to make the optimizer intrinsically robust to activation scale and shape, washing out differences that accumulate under plain Muon. No activation swap is worth pursuing for a record under the current stack.
+
+The statistically solid finding — gating reverses significantly under Muon (p<0.05, n=4 seeds, all four gated variants) — is documented in detail in [`competition_strategy.html`](competition_strategy.html).
+
+Harness: [`experiments/trilu/phase1.py`](experiments/trilu/phase1.py). Real-stack kernel integration: [`triton_kernels.py`](triton_kernels.py), [`train_gpt.py`](train_gpt.py) (`NANOGPT_MLP_ACT` env flag). Rented-H100 A/B framework (unused): [`deploy/`](deploy/).
 
 ---
 
