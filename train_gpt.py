@@ -39,10 +39,11 @@ from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction,
 # Fused triton kernel: relu(x @ W1.T)^2 @ W2.T
 # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
 ReLUSqrdMLP = FusedLinearReLUSquareFunction.apply
-# MLP activation: "relu2" = relu(z)^2 (incumbent, default), "relu2_s1" = relu(z)^2 + relu(z).
-# Same matmul cost; relu2_s1 fixes ReLU^2's gradient-starved origin. Selected via env so the
-# default run is byte-for-byte unchanged. See experiments/trilu for the supporting study.
-MLP_ACT = {"relu2": 0, "relu2_s1": 1}[os.environ.get("NANOGPT_MLP_ACT", "relu2")]
+# MLP activation (all same matmul cost; the kernel is matmul-bound so the pointwise choice is
+# ~free): "relu2" = relu(z)^2 (incumbent, default); "relu2_s1" = relu(z)^2 + relu(z) (fixes the
+# gradient-starved origin); "sniqu" = 0.560*(eluquad(z)-0.706), a dense self-normalizing variant.
+# Selected via env so the default run is byte-for-byte unchanged. See experiments/trilu.
+MLP_ACT = {"relu2": 0, "relu2_s1": 1, "sniqu": 2}[os.environ.get("NANOGPT_MLP_ACT", "relu2")]
 
 dynamo.config.recompile_limit = 64
 

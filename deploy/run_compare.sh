@@ -9,18 +9,19 @@ set -u
 SEEDS="${SEEDS:-3}"
 NPROC="${NPROC:-8}"
 OUT="${OUT:-runs_ab}"
+VARIANTS="${VARIANTS:-relu2 relu2_s1 sniqu}"   # baseline first; all are same-cost
 mkdir -p "$OUT"
 cd "$(dirname "$0")/.."
 
-run() {  # $1 = relu2|relu2_s1   $2 = seed
+run() {  # $1 = relu2|relu2_s1|sniqu   $2 = seed
   local act="$1" seed="$2" log="$OUT/${act}_seed${seed}.log"
   echo "[ab] $act  seed=$seed  -> $log  ($(date))"
   SEED="$seed" NANOGPT_MLP_ACT="$act" \
     torchrun --standalone --nproc_per_node="$NPROC" train_gpt.py 2>&1 | tee "$log"
 }
 
-for s in $(seq 0 $((SEEDS-1))); do
-  for act in relu2 relu2_s1; do
+for s in $(seq 0 $((SEEDS-1))); do      # seeds OUTER, variants INNER
+  for act in $VARIANTS; do
     run "$act" "$s"
   done
 done

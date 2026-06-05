@@ -1,25 +1,17 @@
-"""Correctness test for the relu2_s1 fused-MLP kernel edit.
+"""Correctness test for the fused-MLP activation kernel edits.
 
-The real stack (train_gpt.py + triton_kernels.py) computes the MLP with a fused
-Triton kernel `linear_relu_square_kernel` that hardcodes  post = relu(pre)^2  and,
-in its backward pass,  dpre = grad * 2*relu(pre).  Switching the incumbent to
-relu2_s1  ( act(z) = relu(z)^2 + relu(z) )  is a localized edit:
+The real stack (train_gpt.py + triton_kernels.py) computes the MLP with a fused Triton
+kernel `linear_relu_square_kernel`. We add alternative activations selected by an ACT flag:
 
-    forward :  post = relu(pre)^2 + relu(pre)
-    backward:  dpre = grad * ( 2*relu(pre) + 1[pre>0] )
+    ACT=0  relu2     post = relu(z)^2                 dpre = grad * 2*relu(z)
+    ACT=1  relu2_s1  post = relu(z)^2 + relu(z)       dpre = grad * (2*relu(z) + 1[z>0])
+    ACT=2  sniqu     post = LAM*(eluquad(z) - BETA)   dpre = grad * LAM*eluquad'(z)
+           eluquad(z) = z+z^2 (z>=0) | z/(1-z) (z<0);  LAM=0.56004, BETA=0.70638
 
-This file validates that edit two ways:
+Part A (CPU, fp64, default): pure-torch Function with the SAME manual backward algebra as the
+    kernel, checked by gradcheck + against autograd through an eager reference. Proves the math.
+Part B (GPU, --gpu): the actual modified Triton kernel, fwd+bwd vs fp32 eager. Proves the kernel.
 
-  Part A (CPU, fp64, default): a pure-torch autograd.Function that implements the
-      SAME manual backward algebra as the kernel (dW2, dpre, dW1, dx), checked with
-      torch.autograd.gradcheck and against autograd through an eager reference. This
-      proves the math going into the kernel -- no GPU, cannot perturb the grid.
-
-  Part B (GPU, --gpu): the actual modified Triton kernel (ACT constexpr flag, relu2
-      vs relu2_s1), forward + backward vs an fp32 eager reference. This proves the
-      real kernel that will run on the H100. Run when the GPU is free.
-
-Usage:
     python experiments/trilu/test_fused_mlp.py          # Part A only (CPU)
     python experiments/trilu/test_fused_mlp.py --gpu     # Part A + Part B (Triton)
 """
@@ -27,90 +19,91 @@ import sys
 import torch
 import torch.nn.functional as F
 
+LAM, BETA = 0.56004, 0.70638
+NAMES = {0: "relu2", 1: "relu2_s1", 2: "sniqu"}
+
 
 # -----------------------------------------------------------------------------
 # Activation algebra (single source of truth for the references)
-#   relu2    : f(z) = relu(z)^2            f'(z) = 2*relu(z)
-#   relu2_s1 : f(z) = relu(z)^2 + relu(z)  f'(z) = 2*relu(z) + 1[z>0]
-def act_fwd(z, s1: bool):
-    r = F.relu(z)
-    return r * r + r if s1 else r * r
+def act_fwd(z, act):
+    pos = F.relu(z)
+    if act == 0:
+        return pos * pos
+    if act == 1:
+        return pos * pos + pos
+    neg = z - pos                              # = min(z, 0) <= 0
+    h = pos + pos * pos + neg / (1.0 - neg)    # eluquad
+    return LAM * (h - BETA)
 
-def act_dfwd(z, s1: bool):           # f'(z)
-    r = F.relu(z)
-    g = 2 * r
-    if s1:
-        g = g + (z > 0).to(z.dtype)
-    return g
+
+def act_dfwd(z, act):                          # d/dz act(z)
+    pos = F.relu(z)
+    if act == 0:
+        return 2 * pos
+    if act == 1:
+        return 2 * pos + (z > 0).to(z.dtype)
+    neg = torch.minimum(z, torch.zeros_like(z))
+    inv = 1.0 / (1.0 - neg)                     # safe: 1-neg >= 1
+    dh = torch.where(z >= 0, 1.0 + 2.0 * pos, inv * inv)
+    return LAM * dh
 
 
 # -----------------------------------------------------------------------------
 # Part A: pure-torch Function with the kernel's MANUAL backward algebra.
-# MLP shapes match the kernel:  x (M,K)  W1 (N,K)  W2 (N,K)
-#   pre  = x @ W1.T          (M,N)
-#   post = act(pre)          (M,N)
-#   out  = post @ W2         (M,K)
+#   pre = x @ W1.T   post = act(pre)   out = post @ W2     (x (M,K) W1 (N,K) W2 (N,K))
 class ManualMLP(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, W1, W2, s1: bool):
+    def forward(ctx, x, W1, W2, act):
         pre = x @ W1.T
-        post = act_fwd(pre, s1)
+        post = act_fwd(pre, act)
         out = post @ W2
         ctx.save_for_backward(x, W1, W2, pre, post)
-        ctx.s1 = s1
+        ctx.act = act
         return out
 
     @staticmethod
     def backward(ctx, grad_out):
         x, W1, W2, pre, post = ctx.saved_tensors
-        s1 = ctx.s1
-        dpost = grad_out @ W2.T               # (M,N)
-        dpre = dpost * act_dfwd(pre, s1)      # (M,N)  <-- the kernel's elementwise step
-        dW2 = post.T @ grad_out               # (N,K)
-        dW1 = dpre.T @ x                      # (N,K)
-        dx = dpre @ W1                        # (M,K)
+        dpost = grad_out @ W2.T
+        dpre = dpost * act_dfwd(pre, ctx.act)      # the kernel's elementwise step
+        dW2 = post.T @ grad_out
+        dW1 = dpre.T @ x
+        dx = dpre @ W1
         return dx, dW1, dW2, None
 
 
-def eager_mlp(x, W1, W2, s1: bool):
-    """Reference: plain autograd, no manual backward."""
-    return act_fwd(x @ W1.T, s1) @ W2
+def eager_mlp(x, W1, W2, act):
+    return act_fwd(x @ W1.T, act) @ W2
 
 
 def part_a():
     torch.manual_seed(0)
-    M, K, N = 4, 6, 8     # tiny; gradcheck is O(n^2) in input size
+    M, K, N = 4, 6, 8
     ok = True
-    for s1 in (False, True):
-        name = "relu2_s1" if s1 else "relu2"
+    for act in (0, 1, 2):
         x = torch.randn(M, K, dtype=torch.float64, requires_grad=True)
         W1 = torch.randn(N, K, dtype=torch.float64, requires_grad=True)
         W2 = torch.randn(N, K, dtype=torch.float64, requires_grad=True)
-
-        # (1) gradcheck the manual backward
         gc = torch.autograd.gradcheck(
-            lambda a, b, c: ManualMLP.apply(a, b, c, s1), (x, W1, W2),
+            lambda a, b, c: ManualMLP.apply(a, b, c, act), (x, W1, W2),
             eps=1e-6, atol=1e-6, rtol=1e-4)
-
-        # (2) manual grads vs autograd-through-eager (independent reference)
         xs = [t.detach().clone().requires_grad_(True) for t in (x, W1, W2)]
-        ManualMLP.apply(*xs, s1).sum().backward()
+        ManualMLP.apply(*xs, act).sum().backward()
         ys = [t.detach().clone().requires_grad_(True) for t in (x, W1, W2)]
-        eager_mlp(*ys, s1).sum().backward()
+        eager_mlp(*ys, act).sum().backward()
         gerr = max((a.grad - b.grad).abs().max().item() for a, b in zip(xs, ys))
-        ferr = (ManualMLP.apply(*xs, s1) - eager_mlp(*ys, s1)).abs().max().item()
-
+        ferr = (ManualMLP.apply(*xs, act) - eager_mlp(*ys, act)).abs().max().item()
         passed = gc and gerr < 1e-9 and ferr < 1e-9
         ok = ok and passed
-        print(f"  [A] {name:9s} gradcheck={gc}  fwd_err={ferr:.2e}  grad_err={gerr:.2e}  "
+        print(f"  [A] {NAMES[act]:9s} gradcheck={gc}  fwd_err={ferr:.2e}  grad_err={gerr:.2e}  "
               f"-> {'PASS' if passed else 'FAIL'}")
     return ok
 
 
 # -----------------------------------------------------------------------------
-# Part B: the actual modified Triton kernel (ACT constexpr).  Imports triton only
-# when --gpu is requested so Part A stays dependency-free.
+# Part B: the actual modified Triton kernel.
 def part_b():
+    import os
     import triton
     import triton.language as tl
     from triton.tools.tensor_descriptor import TensorDescriptor
@@ -121,7 +114,9 @@ def part_b():
                                  BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
                                  BLOCK_SIZE_K: tl.constexpr, GROUP_SIZE_M: tl.constexpr,
                                  NUM_SMS: tl.constexpr, FORWARD: tl.constexpr,
-                                 ACT: tl.constexpr):           # 0=relu2, 1=relu2_s1
+                                 ACT: tl.constexpr):          # 0=relu2 1=relu2_s1 2=sniqu
+        LAM = 0.56004
+        BETA = 0.70638
         dtype = tl.bfloat16
         start_pid = tl.program_id(axis=0)
         num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
@@ -151,31 +146,52 @@ def part_b():
             acc = tl.permute(acc, (0, 2, 1))
             acc0, acc1 = tl.split(acc)
 
+            # ---- c0 half ----
             c0 = acc0.to(dtype)
             if not FORWARD:
                 c0_pre = aux_desc.load([offs_am_c, offs_bn_c])
-                r0 = tl.where(c0_pre > 0, c0_pre, 0)
-                if ACT == 0:
-                    c0 = 2 * c0 * r0
-                else:
+                if ACT == 2:
+                    pos0 = tl.maximum(c0_pre, 0.0); neg0 = tl.minimum(c0_pre, 0.0)
+                    inv0 = 1.0 / (1.0 - neg0)
+                    dh0 = tl.where(c0_pre >= 0, 1.0 + 2.0 * pos0, inv0 * inv0)
+                    c0 = c0 * (LAM * dh0)
+                elif ACT == 1:
                     c0 = c0 * tl.where(c0_pre > 0, 2 * c0_pre + 1, 0.0)
+                else:
+                    c0 = 2 * c0 * tl.where(c0_pre > 0, c0_pre, 0)
             c_desc.store([offs_am_c, offs_bn_c], c0)
             if FORWARD:
-                p0 = tl.maximum(c0, 0)
-                c0_post = p0 * p0 + p0 if ACT == 1 else p0 * p0
+                if ACT == 2:
+                    pos0 = tl.maximum(c0, 0.0); neg0 = tl.minimum(c0, 0.0)
+                    h0 = pos0 + pos0 * pos0 + neg0 / (1.0 - neg0)
+                    c0_post = LAM * (h0 - BETA)
+                else:
+                    p0 = tl.maximum(c0, 0.0)
+                    c0_post = p0 * p0 + p0 if ACT == 1 else p0 * p0
                 aux_desc.store([offs_am_c, offs_bn_c], c0_post)
 
+            # ---- c1 half ----
             c1 = acc1.to(dtype)
             if not FORWARD:
                 c1_pre = aux_desc.load([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2])
-                if ACT == 0:
-                    c1 = 2 * c1 * tl.where(c1_pre > 0, c1_pre, 0)
-                else:
+                if ACT == 2:
+                    pos1 = tl.maximum(c1_pre, 0.0); neg1 = tl.minimum(c1_pre, 0.0)
+                    inv1 = 1.0 / (1.0 - neg1)
+                    dh1 = tl.where(c1_pre >= 0, 1.0 + 2.0 * pos1, inv1 * inv1)
+                    c1 = c1 * (LAM * dh1)
+                elif ACT == 1:
                     c1 = c1 * tl.where(c1_pre > 0, 2 * c1_pre + 1, 0.0)
+                else:
+                    c1 = 2 * c1 * tl.where(c1_pre > 0, c1_pre, 0)
             c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1)
             if FORWARD:
-                p1 = tl.maximum(c1, 0)
-                c1_post = p1 * p1 + p1 if ACT == 1 else p1 * p1
+                if ACT == 2:
+                    pos1 = tl.maximum(c1, 0.0); neg1 = tl.minimum(c1, 0.0)
+                    h1 = pos1 + pos1 * pos1 + neg1 / (1.0 - neg1)
+                    c1_post = LAM * (h1 - BETA)
+                else:
+                    p1 = tl.maximum(c1, 0.0)
+                    c1_post = p1 * p1 + p1 if ACT == 1 else p1 * p1
                 aux_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1_post)
 
     def linear_act_square(a, b, act, aux=None):
@@ -186,10 +202,8 @@ def part_b():
         if FORWARD:
             aux = torch.empty((M, N), device=a.device, dtype=a.dtype)
         NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
-        # Production (H100) tiles are BM=128, BN=256, BK=64, num_stages=4 (~180KB smem).
-        # Consumer cards (sm_120, ~101KB smem) need smaller tiles; the relu2_s1 math is
-        # tile-size independent, so this still validates the kernel edit. Override via env.
-        import os
+        # Production (H100) tiles are BM=128 BN=256 BK=64 stages=4 (~180KB smem). Consumer cards
+        # (sm_120, ~101KB) need smaller tiles; the activation math is tile-size independent.
         BM = int(os.environ.get("TEST_BM", 64))
         BN = int(os.environ.get("TEST_BN", 128))
         BK = int(os.environ.get("TEST_BK", 64))
@@ -224,10 +238,9 @@ def part_b():
 
     torch.manual_seed(0)
     dev = "cuda"
-    M, K, N = 512, 768, 2048          # realistic-ish MLP shape
+    M, K, N = 512, 768, 2048
     ok = True
-    for act, s1 in ((0, False), (1, True)):
-        name = "relu2_s1" if s1 else "relu2"
+    for act in (0, 1, 2):
         x = torch.randn(M, K, device=dev, dtype=torch.bfloat16).requires_grad_(True)
         W1 = (torch.randn(N, K, device=dev, dtype=torch.bfloat16) / K**0.5).requires_grad_(True)
         W2 = (torch.randn(N, K, device=dev, dtype=torch.bfloat16) / N**0.5).requires_grad_(True)
@@ -235,21 +248,16 @@ def part_b():
         g = torch.randn_like(out)
         out.backward(g)
         fused = (out.float(), x.grad.float(), W1.grad.float(), W2.grad.float())
-
-        # fp32 eager reference
         xr = x.detach().float().requires_grad_(True)
         W1r = W1.detach().float().requires_grad_(True)
         W2r = W2.detach().float().requires_grad_(True)
-        outr = act_fwd(xr @ W1r.T, s1) @ W2r
+        outr = act_fwd(xr @ W1r.T, act) @ W2r
         outr.backward(g.float())
         ref = (outr, xr.grad, W1r.grad, W2r.grad)
-
-        def relerr(a, b):
-            return ((a - b).norm() / (b.norm() + 1e-6)).item()
-        errs = [relerr(a, b) for a, b in zip(fused, ref)]
-        passed = max(errs) < 3e-2     # bf16 fused vs fp32 ref
+        errs = [((a - b).norm() / (b.norm() + 1e-6)).item() for a, b in zip(fused, ref)]
+        passed = max(errs) < 3e-2
         ok = ok and passed
-        print(f"  [B] {name:9s} relerr out/dx/dW1/dW2 = "
+        print(f"  [B] {NAMES[act]:9s} relerr out/dx/dW1/dW2 = "
               f"{errs[0]:.2e}/{errs[1]:.2e}/{errs[2]:.2e}/{errs[3]:.2e} -> {'PASS' if passed else 'FAIL'}")
     return ok
 

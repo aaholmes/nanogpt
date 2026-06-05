@@ -17,7 +17,10 @@ PAT = re.compile(r"step:(\d+)/\d+\s+val_loss:([0-9.]+)\s+train_time:([0-9.]+)ms"
 
 def act_of(f):
     b = os.path.basename(f)
-    return "relu2_s1" if "relu2_s1" in b else ("relu2" if "relu2" in b else b)
+    for a in ("relu2_s1", "sniqu", "relu2"):   # check compound/distinct names before "relu2"
+        if a in b:
+            return a
+    return b
 
 
 def seed_of(f):
@@ -54,23 +57,24 @@ for act in sorted(rows):
         extra = "" if r["hit"] else f"   (final: {fmt(r['final'])})"
         print(f"  seed {seed}: {fmt(r['hit'])}{extra}")
 
-if "relu2" in rows and "relu2_s1" in rows:
-    seeds = sorted(set(rows["relu2"]) & set(rows["relu2_s1"]))
-    dsec, dstep = [], []
-    print("\n[paired relu2_s1 - relu2]")
-    for s in seeds:
-        a, b = rows["relu2"][s]["hit"], rows["relu2_s1"][s]["hit"]
-        if a and b:
-            dsec.append((b[2] - a[2]) / 1000.0)
-            dstep.append(b[0] - a[0])
-            print(f"  seed {s}: {dsec[-1]:+.1f}s   {dstep[-1]:+d} steps")
-        else:
-            print(f"  seed {s}: incomplete (a variant did not reach 3.28)")
-    if dsec:
-        msec = sum(dsec) / len(dsec)
-        mstep = sum(dstep) / len(dstep)
-        tail = f", sd={st.stdev(dsec):.1f}s" if len(dsec) > 1 else ""
-        print(f"\nMEAN: relu2_s1 - relu2 = {msec:+.1f}s  ({mstep:+.0f} steps)  to 3.28  "
-              f"(n={len(dsec)} paired{tail})")
-        print("VERDICT:", "relu2_s1 FASTER to target -> consider full record attempt"
-              if msec < 0 else "relu2_s1 not faster -> stop")
+# each candidate paired against the relu2 baseline (wallclock-to-3.28)
+if "relu2" in rows:
+    for cand in [a for a in sorted(rows) if a != "relu2"]:
+        seeds = sorted(set(rows["relu2"]) & set(rows[cand]))
+        dsec, dstep = [], []
+        print(f"\n[paired {cand} - relu2]")
+        for s in seeds:
+            base, c = rows["relu2"][s]["hit"], rows[cand][s]["hit"]
+            if base and c:
+                dsec.append((c[2] - base[2]) / 1000.0)
+                dstep.append(c[0] - base[0])
+                print(f"  seed {s}: {dsec[-1]:+.1f}s   {dstep[-1]:+d} steps")
+            else:
+                print(f"  seed {s}: incomplete (a variant did not reach 3.28)")
+        if dsec:
+            msec = sum(dsec) / len(dsec)
+            mstep = sum(dstep) / len(dstep)
+            tail = f", sd={st.stdev(dsec):.1f}s" if len(dsec) > 1 else ""
+            print(f"  MEAN: {cand} - relu2 = {msec:+.1f}s  ({mstep:+.0f} steps)  to 3.28  "
+                  f"(n={len(dsec)} paired{tail})  "
+                  f"-> {'FASTER' if msec < 0 else 'not faster'}")

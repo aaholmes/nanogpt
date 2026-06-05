@@ -411,6 +411,8 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
                                  ACT: tl.constexpr,   # 0 = relu(z)^2 ; 1 = relu(z)^2 + relu(z) (relu2_s1)
                                  ):
     dtype = tl.bfloat16
+    SNIQU_LAM = 0.56004    # ACT==2 sniqu: 0.560*(eluquad(z)-0.706), zero-mean/unit-var under N(0,1)
+    SNIQU_BETA = 0.70638
     start_pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
@@ -446,31 +448,49 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
         c0 = acc0.to(dtype)
         if not FORWARD:
             c0_pre = aux_desc.load([offs_am_c, offs_bn_c])
-            if ACT == 0:
-                c0 = 2 * c0 * tl.where(c0_pre > 0, c0_pre, 0)
-            else:
+            if ACT == 2:
+                pos0 = tl.maximum(c0_pre, 0.0); neg0 = tl.minimum(c0_pre, 0.0)
+                inv0 = 1.0 / (1.0 - neg0)
+                c0 = c0 * (SNIQU_LAM * tl.where(c0_pre >= 0, 1.0 + 2.0 * pos0, inv0 * inv0))
+            elif ACT == 1:
                 c0 = c0 * tl.where(c0_pre > 0, 2 * c0_pre + 1, 0.0)
+            else:
+                c0 = 2 * c0 * tl.where(c0_pre > 0, c0_pre, 0)
 
         c_desc.store([offs_am_c, offs_bn_c], c0)
 
         if FORWARD:
-            p0 = tl.maximum(c0, 0)
-            c0_post = p0 * p0 + p0 if ACT == 1 else p0 * p0
+            if ACT == 2:
+                pos0 = tl.maximum(c0, 0.0); neg0 = tl.minimum(c0, 0.0)
+                h0 = pos0 + pos0 * pos0 + neg0 / (1.0 - neg0)
+                c0_post = SNIQU_LAM * (h0 - SNIQU_BETA)
+            else:
+                p0 = tl.maximum(c0, 0)
+                c0_post = p0 * p0 + p0 if ACT == 1 else p0 * p0
             aux_desc.store([offs_am_c, offs_bn_c], c0_post)
 
         c1 = acc1.to(dtype)
         if not FORWARD:
             c1_pre = aux_desc.load([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2])
-            if ACT == 0:
-                c1 = 2 * c1 * tl.where(c1_pre > 0, c1_pre, 0)
-            else:
+            if ACT == 2:
+                pos1 = tl.maximum(c1_pre, 0.0); neg1 = tl.minimum(c1_pre, 0.0)
+                inv1 = 1.0 / (1.0 - neg1)
+                c1 = c1 * (SNIQU_LAM * tl.where(c1_pre >= 0, 1.0 + 2.0 * pos1, inv1 * inv1))
+            elif ACT == 1:
                 c1 = c1 * tl.where(c1_pre > 0, 2 * c1_pre + 1, 0.0)
+            else:
+                c1 = 2 * c1 * tl.where(c1_pre > 0, c1_pre, 0)
 
         c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1)
 
         if FORWARD:
-            p1 = tl.maximum(c1, 0)
-            c1_post = p1 * p1 + p1 if ACT == 1 else p1 * p1
+            if ACT == 2:
+                pos1 = tl.maximum(c1, 0.0); neg1 = tl.minimum(c1, 0.0)
+                h1 = pos1 + pos1 * pos1 + neg1 / (1.0 - neg1)
+                c1_post = SNIQU_LAM * (h1 - SNIQU_BETA)
+            else:
+                p1 = tl.maximum(c1, 0)
+                c1_post = p1 * p1 + p1 if ACT == 1 else p1 * p1
             aux_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1_post)
 
 

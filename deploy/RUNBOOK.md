@@ -7,11 +7,12 @@ estimate). Runs themselves are minutes each; the cost is box-up + data + iterati
 
 ## Already integrated on this branch (validated locally)
 - `triton_kernels.py` — `ACT` constexpr in the fused MLP kernel: `0` = `relu(z)²` (incumbent,
-  default), `1` = `relu(z)²+relu(z)` (relu2_s1). Same matmuls, same cost; only the fused
-  elementwise act/derivative differ. Verified by `experiments/trilu/test_fused_mlp.py`
-  (fp64 gradcheck + the real Triton kernel vs eager, fwd+bwd).
-- `train_gpt.py` — `NANOGPT_MLP_ACT` env (`relu2` default / `relu2_s1`); opt-in `SEED` env for
-  paired A/B. **With neither env set, the run is byte-for-byte the record baseline.**
+  default), `1` = `relu(z)²+relu(z)` (relu2_s1), `2` = `0.560·(eluquad(z)−0.706)` (sniqu).
+  The kernel is matmul-bound, so the pointwise choice (incl. sniqu's reciprocal) is ~free —
+  all three are same-cost. Verified by `experiments/trilu/test_fused_mlp.py` (fp64 gradcheck +
+  the real Triton kernel vs eager, fwd+bwd, all three activations).
+- `train_gpt.py` — `NANOGPT_MLP_ACT` env (`relu2` default / `relu2_s1` / `sniqu`); opt-in `SEED`
+  env for paired A/B. **With neither env set, the run is byte-for-byte the record baseline.**
 
 ## Steps
 
@@ -40,10 +41,12 @@ Must print `ALL PASS`. This validates the exact kernel numerics that will run.
 ```
 NANOGPT_MLP_ACT=relu2    SEED=0 torchrun --standalone --nproc_per_node=8 train_gpt.py
 NANOGPT_MLP_ACT=relu2_s1 SEED=0 torchrun --standalone --nproc_per_node=8 train_gpt.py
+NANOGPT_MLP_ACT=sniqu    SEED=0 torchrun --standalone --nproc_per_node=8 train_gpt.py
 ```
-Confirm both train (val decreasing) and the `relu2` arm matches the known baseline curve.
+Confirm all train (val decreasing) and the `relu2` arm matches the known baseline curve.
 
-**6. A/B:** `SEEDS=3 bash deploy/run_compare.sh`  (3 paired runs each = 6 runs, minutes apiece).
+**6. A/B:** `SEEDS=3 bash deploy/run_compare.sh`  (3 paired runs × 3 arms = 9 runs, minutes
+apiece). Restrict arms with e.g. `VARIANTS="relu2 relu2_s1" SEEDS=3 bash deploy/run_compare.sh`.
 
 **7. Decide** (auto-printed by `deploy/parse_runs.py`): wallclock & steps to 3.28 per variant +
 the paired delta.
@@ -58,8 +61,9 @@ the paired delta.
 - **Official submissions** report the median of several runs with *no* fixed seed — `SEED` here
   exists only to make *our* A/B paired (lower variance). Drop `SEED` for a record submission.
 - **Data size:** if a run aborts reading past the last shard, `bash deploy/setup_data.sh 20`.
-- **Candidate scope:** `relu2_s1` is the only *same-cost* candidate in this fused kernel.
-  `eluquad`/`sniqu` would need a reciprocal inside the kernel (extra cost) — out of scope here;
-  revisit only if the local grid shows them clearly ahead *and* the cost can be hidden.
+- **Candidate scope:** `relu2_s1` and `sniqu` are both integrated and **same-cost** (the kernel
+  is matmul-bound, so sniqu's extra reciprocal is negligible). `relu2_s1` is the minimal change
+  off the incumbent; `sniqu` led the local grid at seed 0. The A/B runs all three so the H100
+  picks the winner on wallclock-to-3.28 directly — no cost thumb on the scale.
 - **What this gate cannot skip:** it *is* the transfer test (loss regime → 3.28, large batch,
   FP8, real arch). Don't go local-grid → record without it.
