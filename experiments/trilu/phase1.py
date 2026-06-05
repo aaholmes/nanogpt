@@ -598,14 +598,36 @@ def orthogonalize(G, method="polar_express"):
     return X.to(G.dtype)
 
 
+@torch.no_grad()
+def normuon_variance_reduce(v, buf, beta2):
+    """NorMuon's neuron-wise variance normalization of an orthogonalized update v (2D).
+    Ported from the record's _apply_normuon_variance_reduction. Maintains a per-neuron
+    second-moment EMA `buf`, divides each neuron's update by sqrt of it, then globally
+    rescales so the Frobenius norm is unchanged -- so it only *redistributes* magnitude
+    across neurons (the larger dim), leaving the overall step size (and LR meaning) fixed.
+    arXiv 2510.05491. buf shape = v with the reduced dim collapsed to 1."""
+    red_dim = -1 if v.size(-2) >= v.size(-1) else -2   # average over the shorter dim
+    n = v.size(red_dim)
+    v_mean = v.float().square().mean(dim=red_dim, keepdim=True)      # per-neuron mean-square
+    v_norm = (v_mean.sum() * n).sqrt()                              # ||v||_F
+    buf.lerp_(v_mean.to(buf.dtype), 1 - beta2)                      # second-moment EMA
+    step = buf.clamp_min(1e-10).rsqrt()                            # per-neuron 1/sqrt(v2)
+    v_norm_new = ((v_mean * n) * step.float().square()).sum().sqrt().clamp_min(1e-10)
+    return v.mul_((step * (v_norm / v_norm_new)).type_as(v))        # normalize, preserve ||·||_F
+
+
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ortho="polar_express"):
-        super().__init__(params, dict(lr=lr, momentum=momentum, nesterov=nesterov, ortho=ortho))
+    """Muon (momentum SGD + orthogonalized update). With beta2 set, becomes NorMuon:
+    adds the neuron-wise variance normalization the real record uses."""
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ortho="polar_express",
+                 beta2=None):
+        super().__init__(params, dict(lr=lr, momentum=momentum, nesterov=nesterov,
+                                      ortho=ortho, beta2=beta2))
 
     @torch.no_grad()
     def step(self):
         for group in self.param_groups:
-            lr, momentum = group["lr"], group["momentum"]
+            lr, momentum, beta2 = group["lr"], group["momentum"], group["beta2"]
             for p in group["params"]:
                 if p.grad is None:
                     continue
@@ -617,8 +639,16 @@ class Muon(torch.optim.Optimizer):
                 buf.mul_(momentum).add_(g)
                 g = g.add(buf, alpha=momentum) if group["nesterov"] else buf
                 g = orthogonalize(g, method=group["ortho"])
-                # shape-aware scale so the RMS update is comparable across matrices
-                p.add_(g, alpha=-lr * max(1.0, p.size(0) / p.size(1)) ** 0.5)
+                if beta2 is not None:           # NorMuon: neuron-wise variance normalization
+                    if "v2_buffer" not in state:
+                        shape = list(g.shape)
+                        shape[-1 if g.size(-2) >= g.size(-1) else -2] = 1
+                        state["v2_buffer"] = torch.zeros(shape, device=g.device, dtype=torch.float32)
+                    g = normuon_variance_reduce(g, state["v2_buffer"], beta2)
+                    p.add_(g, alpha=-lr)        # variance-reduce preserves ||·||_F; lr applied directly
+                else:
+                    # shape-aware scale so the RMS update is comparable across matrices
+                    p.add_(g, alpha=-lr * max(1.0, p.size(0) / p.size(1)) ** 0.5)
 
 
 def build_optimizers(model, config):
@@ -649,10 +679,12 @@ def build_optimizers(model, config):
             adam_groups.append({"params": params, "base_lr": base, "lr": base})
 
     opts = []
-    if config.get("optimizer", "adamw") == "muon":
+    opt_name = config.get("optimizer", "adamw")
+    if opt_name in ("muon", "normuon"):
         mlr = config.get("muon_lr", 0.02)
+        beta2 = config.get("muon_beta2", 0.9) if opt_name == "normuon" else None
         opts.append(Muon([{"params": body, "base_lr": mlr, "lr": mlr}], lr=mlr,
-                         ortho=config.get("muon_ortho", "polar_express")))
+                         ortho=config.get("muon_ortho", "polar_express"), beta2=beta2))
         add_adam(other, lr)
     else:
         add_adam(body + other, lr)
@@ -905,10 +937,13 @@ def main():
                     help="zero-init the gate matrix. With a bounded gate this starts every valve "
                          "at 0.5 (max-derivative, agnostic), learning its direction from there; "
                          "with a linear gate it zeroes the block output (ReZero-style). Gated only.")
-    ap.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "muon"],
-                    help="adamw (default) or muon (Newton-Schulz-orthogonalized momentum on the "
-                         "hidden matrices, AdamW on embeddings/norms) -- the real modded-nanogpt optimizer.")
-    ap.add_argument("--muon-lr", type=float, default=0.02, help="base LR for the Muon group.")
+    ap.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "muon", "normuon"],
+                    help="adamw (default); muon (orthogonalized momentum on the hidden matrices, "
+                         "AdamW on embeddings/norms); normuon (muon + neuron-wise variance "
+                         "normalization -- the real record's optimizer, arXiv 2510.05491).")
+    ap.add_argument("--muon-lr", type=float, default=0.02, help="base LR for the Muon/NorMuon group.")
+    ap.add_argument("--muon-beta2", type=float, default=0.9,
+                    help="NorMuon second-moment EMA decay (only used with --optimizer normuon).")
     ap.add_argument("--muon-ortho", type=str, default="polar_express",
                     choices=["polar_express", "newton_schulz"],
                     help="orthogonalizer for Muon. polar_express = the real modded-nanogpt schedule "
@@ -943,6 +978,7 @@ def main():
     cfg_base["ce_chunk"] = args.ce_chunk
     cfg_base["optimizer"] = args.optimizer
     cfg_base["muon_lr"] = args.muon_lr
+    cfg_base["muon_beta2"] = args.muon_beta2
     cfg_base["muon_ortho"] = args.muon_ortho
     cfg_base["target_loss"] = args.target_loss
 
