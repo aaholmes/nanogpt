@@ -39,6 +39,10 @@ from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction,
 # Fused triton kernel: relu(x @ W1.T)^2 @ W2.T
 # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
 ReLUSqrdMLP = FusedLinearReLUSquareFunction.apply
+# MLP activation: "relu2" = relu(z)^2 (incumbent, default), "relu2_s1" = relu(z)^2 + relu(z).
+# Same matmul cost; relu2_s1 fixes ReLU^2's gradient-starved origin. Selected via env so the
+# default run is byte-for-byte unchanged. See experiments/trilu for the supporting study.
+MLP_ACT = {"relu2": 0, "relu2_s1": 1}[os.environ.get("NANOGPT_MLP_ACT", "relu2")]
 
 dynamo.config.recompile_limit = 64
 
@@ -1350,7 +1354,7 @@ class GPT(nn.Module):
                 attn_in = x_backout if x_backout is not None else x
                 attn_out = attn(norm(attn_in), attn_args, qkvo_w)
                 x = resid_lambdas_attn[i] * x + post_lambdas_attn[i] * attn_out + x0_inject[i]
-            x = resid_lambdas_mlp[i] * x + post_lambdas_mlp[i] * ReLUSqrdMLP(norm(x), c_fc, c_proj)
+            x = resid_lambdas_mlp[i] * x + post_lambdas_mlp[i] * ReLUSqrdMLP(norm(x), c_fc, c_proj, MLP_ACT)
             if i == 3:
                 skip_connection = x
             if i == 7:
@@ -1884,6 +1888,14 @@ def nvidia_smi():
     return subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
 print0(nvidia_smi())
 print0("="*100)
+
+# Opt-in determinism for paired A/B measurement (e.g. relu2 vs relu2_s1 at matched init).
+# No-op unless SEED is set, so the default/record run is unchanged.
+if "SEED" in os.environ:
+    seed = int(os.environ["SEED"])
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    print0(f"Seeded torch RNG with SEED={seed} (paired-A/B mode)", console=True)
 
 model: nn.Module = GPT(
     vocab_size=50257,

@@ -408,6 +408,7 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
                                  GROUP_SIZE_M: tl.constexpr,
                                  NUM_SMS: tl.constexpr,
                                  FORWARD: tl.constexpr,
+                                 ACT: tl.constexpr,   # 0 = relu(z)^2 ; 1 = relu(z)^2 + relu(z) (relu2_s1)
                                  ):
     dtype = tl.bfloat16
     start_pid = tl.program_id(axis=0)
@@ -445,29 +446,35 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
         c0 = acc0.to(dtype)
         if not FORWARD:
             c0_pre = aux_desc.load([offs_am_c, offs_bn_c])
-            c0 = 2 * c0 * tl.where(c0_pre > 0, c0_pre, 0)
+            if ACT == 0:
+                c0 = 2 * c0 * tl.where(c0_pre > 0, c0_pre, 0)
+            else:
+                c0 = c0 * tl.where(c0_pre > 0, 2 * c0_pre + 1, 0.0)
 
         c_desc.store([offs_am_c, offs_bn_c], c0)
 
         if FORWARD:
-            c0_post = tl.maximum(c0, 0)
-            c0_post = c0_post * c0_post
+            p0 = tl.maximum(c0, 0)
+            c0_post = p0 * p0 + p0 if ACT == 1 else p0 * p0
             aux_desc.store([offs_am_c, offs_bn_c], c0_post)
 
         c1 = acc1.to(dtype)
         if not FORWARD:
             c1_pre = aux_desc.load([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2])
-            c1 = 2 * c1 * tl.where(c1_pre > 0, c1_pre, 0)
+            if ACT == 0:
+                c1 = 2 * c1 * tl.where(c1_pre > 0, c1_pre, 0)
+            else:
+                c1 = c1 * tl.where(c1_pre > 0, 2 * c1_pre + 1, 0.0)
 
         c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1)
 
         if FORWARD:
-            c1_post = tl.maximum(c1, 0)
-            c1_post = c1_post * c1_post
+            p1 = tl.maximum(c1, 0)
+            c1_post = p1 * p1 + p1 if ACT == 1 else p1 * p1
             aux_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1_post)
 
 
-def linear_relu_square(a, b, aux=None):
+def linear_relu_square(a, b, aux=None, act=0):
     M, K = a.shape
     N, K = b.shape
     dtype = a.dtype
@@ -507,6 +514,7 @@ def linear_relu_square(a, b, aux=None):
         GROUP_SIZE_M=1,
         NUM_SMS=NUM_SMS,
         FORWARD=FORWARD,
+        ACT=act,
         num_stages=num_stages,
         num_warps=num_warps
     )
@@ -518,20 +526,23 @@ def linear_relu_square(a, b, aux=None):
 
 class FusedLinearReLUSquareFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, W1, W2):
-        pre, post = linear_relu_square(x.view((-1, x.shape[-1])), W1)
+    def forward(ctx, x, W1, W2, act=0):
+        # act: 0 = relu(z)^2 (incumbent), 1 = relu(z)^2 + relu(z) (relu2_s1). Same matmul
+        # structure and cost; only the fused elementwise act/derivative differ.
+        pre, post = linear_relu_square(x.view((-1, x.shape[-1])), W1, act=act)
         x3 = post @ W2
         ctx.save_for_backward(x, W1, W2, pre, post)
+        ctx.act = act
         return x3.view(x.shape)
 
     @staticmethod
     def backward(ctx, grad_output):
         x, W1, W2, pre, post = ctx.saved_tensors
         dW2 = post.T @ grad_output
-        dpre = linear_relu_square(grad_output.view((-1, grad_output.shape[-1])), W2, aux=pre)
+        dpre = linear_relu_square(grad_output.view((-1, grad_output.shape[-1])), W2, aux=pre, act=ctx.act)
         dW1 = dpre.T @ x
         dx = dpre @ W1
-        return dx.view(x.shape), dW1, dW2
+        return dx.view(x.shape), dW1, dW2, None
 
 
 # -----------------------------------------------------------------------------
