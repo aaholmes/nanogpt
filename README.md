@@ -416,7 +416,15 @@ Two MLP structures × several activations, all at 124M (nanogpt-small scale), lo
 | reglu (gated) | +0.104 | **0.042** |
 | dquad (gated) | +0.162 | **0.013** |
 
-All four gated variants are significantly worse than ReLU² under Muon (p<0.05). The ~0.09 AdamW gating advantage flips to a ~0.10–0.16 penalty. A 2-seed LR-robustness grid added `sniqu` (consistent −0.052 vs ReLU², not yet significant at n=2) and confirmed `selu` trails by +0.11.
+All four gated variants are significantly worse than ReLU² under Muon (p<0.05). The ~0.09 AdamW gating advantage flips to a ~0.10–0.16 penalty. A powered 9-seed grid then tested standard-MLP alternatives:
+
+| Variant | n | vs ReLU² (Δ) | p-value |
+|---------|---|-------------|---------|
+| **sniqu** | 9 | **−0.076** (all seeds same sign) | **p<0.0001** |
+| relu2_s1 | 9 | −0.010 (mixed sign) | 0.57 ns |
+| selu | 2 | +0.114 | — |
+
+`sniqu` (eluquad self-normalized to zero mean / unit variance) significantly beats ReLU² under Muon. `relu2_s1` is a confirmed null. `selu`'s poor performance isolates the effect: quadratic curvature, not moment-matching alone, is what helps `sniqu`.
 
 **Under NorMuon — the production optimizer (1 seed, 5-LR sweep, 2000 steps):**
 
@@ -424,13 +432,15 @@ All four gated variants are significantly worse than ReLU² under Muon (p<0.05).
 |----|-------|----------|-------|
 | 0.02 ★ | **6.414** | 6.425 (+0.011) | 6.426 (+0.012) |
 
-All three standard-MLP variants converge to the same optimal LR (0.02, consistent with the record's 0.023) and land within 0.012 nats of each other — indistinguishable within single-seed noise. The sniqu Muon advantage does not survive NorMuon.
+All three variants converge to the same optimal LR (0.02, consistent with the record's 0.023) and land within 0.012 nats — indistinguishable within single-seed noise. The significant Muon advantage for `sniqu` does not survive NorMuon.
 
 ### Conclusion
 
-**Activation-function and gating rankings are optimizer-dependent.** The entire activation canon (GELU, SwiGLU) was established under Adam-family optimizers; these results show those rankings do not reliably transfer to Muon or NorMuon. NorMuon's per-neuron variance normalization appears to make the optimizer intrinsically robust to activation scale and shape, washing out differences that accumulate under plain Muon. No activation swap is worth pursuing for a record under the current stack.
+**Activation-function and gating rankings are optimizer-dependent.** The entire activation canon (GELU, SwiGLU) was established under Adam-family optimizers; these results show those rankings do not reliably transfer to Muon or NorMuon. NorMuon's per-neuron variance normalization appears to make the optimizer intrinsically robust to activation scale and shape, washing out differences that are significant under plain Muon. No activation swap is worth pursuing for a record under the current stack.
 
-The statistically solid finding — gating reverses significantly under Muon (p<0.05, n=4 seeds, all four gated variants) — is documented in detail in [`competition_strategy.html`](competition_strategy.html).
+Two statistically solid findings, documented in detail in [`competition_strategy.html`](competition_strategy.html):
+1. Gating reverses significantly under Muon (p<0.05, n=4, all four gated variants worse by 0.10–0.16)
+2. sniqu beats ReLU² significantly under Muon (p<0.0001, n=9, Δ=−0.076) — but not under NorMuon
 
 Harness: [`experiments/trilu/phase1.py`](experiments/trilu/phase1.py). Real-stack kernel integration: [`triton_kernels.py`](triton_kernels.py), [`train_gpt.py`](train_gpt.py) (`NANOGPT_MLP_ACT` env flag). Rented-H100 A/B framework (unused): [`deploy/`](deploy/).
 
