@@ -41,7 +41,7 @@ from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction,
 ReLUSqrdMLP = FusedLinearReLUSquareFunction.apply
 # MLP activation (all same matmul cost; the kernel is matmul-bound so the pointwise choice is
 # ~free): "relu2" = relu(z)^2 (incumbent, default); "relu2_s1" = relu(z)^2 + relu(z) (fixes the
-# gradient-starved origin); "sniqu" = 0.560*(eluquad(z)-0.706), a dense self-normalizing variant.
+# gradient-starved origin); "sniqu" = 0.560*(iqu(z)-0.706), self-normalizing IQU.
 # Selected via env so the default run is byte-for-byte unchanged. See experiments/trilu.
 MLP_ACT = {"relu2": 0, "relu2_s1": 1, "sniqu": 2}[os.environ.get("NANOGPT_MLP_ACT", "relu2")]
 

@@ -7,7 +7,7 @@ estimate). Runs themselves are minutes each; the cost is box-up + data + iterati
 
 ## Already integrated on this branch (validated locally)
 - `triton_kernels.py` — `ACT` constexpr in the fused MLP kernel: `0` = `relu(z)²` (incumbent,
-  default), `1` = `relu(z)²+relu(z)` (relu2_s1), `2` = `0.560·(eluquad(z)−0.706)` (sniqu).
+  default), `1` = `relu(z)²+relu(z)` (relu2_s1), `2` = `0.560·(iqu(z)−0.706)` (sniqu).
   The kernel is matmul-bound, so the pointwise choice (incl. sniqu's reciprocal) is ~free —
   all three are same-cost. Verified by `experiments/trilu/test_fused_mlp.py` (fp64 gradcheck +
   the real Triton kernel vs eager, fwd+bwd, all three activations).

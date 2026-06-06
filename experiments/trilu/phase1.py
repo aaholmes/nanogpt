@@ -49,27 +49,26 @@ def _nullctx():
 # -----------------------------------------------------------------------------
 # Activations
 
-class EluQuad(nn.Module):
-    """Dense, C1, slope-1 activation -- a non-sparse ReLU2 with a bounded ELU-like tail:
-        x >= 0:  x + x^2     (sloped-ReLU2 positive branch; slope 1 at the origin)
-        x <  0:  x/(1-x)     (= 1/(1-x)-1; softsign-like, saturates to -1; slope 1 at 0)
-    C1 at the origin (value and slope match). No zeros -> dense activations, which Muon
-    handles better than ReLU2's sparsity; bounded below; cheap (one reciprocal, no exp)."""
+class IQU(nn.Module):
+    """Inverse-and-Quadratic Unit (IQU): C2 piecewise activation with no dead zone.
+        x >= 0:  x + x^2     (quadratic branch; slope 1 and curvature 2 at origin)
+        x <  0:  x/(1-x)     (inverse branch; slope 1 at 0, saturates to -1; no exp)
+    C2 at the origin (value, slope, and curvature all match). No zeros -> dense
+    activations; bounded below; cheap (one reciprocal, no transcendental)."""
     def forward(self, x):
         pos = F.relu(x)
         neg = x - pos                      # = min(x, 0) <= 0, so 1 - neg >= 1 (no div-by-zero)
         return pos + pos * pos + neg / (1.0 - neg)
 
 
-class EluQuadSN(nn.Module):
-    """eluquad given SELU's treatment: scale+shift the same C2 shape so that, for
-    x ~ N(0,1), the OUTPUT is zero-mean and unit-variance (a self-normalizing fixed
-    point on the first two moments, like SELU's lambda/alpha -- here lambda/beta).
-    Constants from Gauss-Hermite quadrature: E[h]=0.70638, Var[h]=3.18830.
-        g(x) = LAM * (eluquad(x) - BETA),  BETA=0.70638, LAM=1/sqrt(3.18830)=0.56004
-    Keeps eluquad's curvature (still leptokurtic, excess kurtosis ~10 -- positive
-    curvature can't be Gaussianized); only fixes scale+mean so the activation stops
-    inflating the residual stream ~1.8x and injecting a mean the norm must undo."""
+class SNIQU(nn.Module):
+    """Self-Normalizing Inverse-and-Quadratic Unit (SNIQU): IQU rescaled so that
+    for x ~ N(0,1) the output is zero-mean and unit-variance. Same self-normalization
+    recipe as SELU (solve moment equations), applied to the IQU shape. Constants from
+    Gauss-Hermite quadrature: E[h]=0.70638, Var[h]=3.18830.
+        sniqu(x) = LAM * (iqu(x) - BETA),  BETA=0.70638, LAM=1/sqrt(3.18830)=0.56004
+    Keeps IQU's curvature (still leptokurtic, excess kurtosis ~10); only fixes
+    scale+mean so the activation stops inflating the residual stream ~1.8x."""
     BETA = 0.70638
     LAM = 0.56004
     def forward(self, x):
@@ -237,10 +236,10 @@ def make_activation(name: str, init: str = "gelu_minimax",
         # No activation: gated MLP becomes (W1 x) * (W2 x) -- Shazeer's Bilinear.
         # The nonlinearity is purely the multiplicative gate. Cheapest gated variant.
         return nn.Identity()
-    if name == "eluquad":
-        return EluQuad()
-    if name in ("eluquad_sn", "sniqu"):   # sniqu = Self-Normalizing Inverse-and-Quadratic Union
-        return EluQuadSN()
+    if name == "iqu":
+        return IQU()
+    if name in ("sniqu", "iqu_sn", "eluquad_sn"):   # sniqu = Self-Normalizing IQU
+        return SNIQU()
     if name == "selu":
         return nn.SELU()
     raise ValueError(f"Unknown activation: {name}")
@@ -877,7 +876,7 @@ CONFIGS = {
 
 
 ALL_ACTIVATIONS = ["relu2", "gelu", "trilu_sym", "trilu_asym", "swiglu", "geglu", "triglu",
-                   "xabsx", "xglu", "reglu", "bilinear", "eluquad", "eluquad_sn", "sniqu", "selu"]
+                   "xabsx", "xglu", "reglu", "bilinear", "iqu", "sniqu", "selu"]
 
 # Default 7-activation sweep covering the standard/gated x ReLU-like/GELU-like/TriLU comparison,
 # plus xglu (gated x|x|) which tests using the negative half of the input distribution.

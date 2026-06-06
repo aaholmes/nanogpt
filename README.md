@@ -397,7 +397,7 @@ This fork investigates whether the MLP activation choice matters in the speedrun
 
 Two MLP structures × several activations, all at 124M (nanogpt-small scale), local harness (RTX 5060 Ti), faithful config (Muon + Polar Express, torch.compile, chunked cross-entropy):
 
-- **Standard MLP** (`W₂·act(W₁x)`): ReLU², relu2_s1 (`ReLU(x)²+ReLU(x)`), eluquad (`x+x²` / `x/(1−x)`), sniqu (eluquad self-normalized to zero mean / unit variance), SELU
+- **Standard MLP** (`W₂·act(W₁x)`): ReLU², relu2_s1 (`ReLU(x)²+ReLU(x)`), iqu (`x+x²` / `x/(1−x)`), sniqu (iqu self-normalized to zero mean / unit variance), SELU
 - **Gated MLP** (`W₃·[act(W₁x)⊙(W₂x)]`): xglu, bilinear, reglu, dquad
 
 ### Results
@@ -409,7 +409,7 @@ Two MLP structures × several activations, all at 124M (nanogpt-small scale), lo
 | Variant | vs ReLU² | p-value |
 |---------|----------|---------|
 | relu2_s1 | −0.057 | 0.19 (ns) |
-| eluquad | −0.044 | 0.11 (ns) |
+| iqu | −0.044 | 0.11 (ns) |
 | **relu2 (incumbent)** | baseline | — |
 | xglu (gated) | +0.098 | **0.024** |
 | bilinear (gated) | +0.103 | **0.025** |
@@ -424,7 +424,7 @@ All four gated variants are significantly worse than ReLU² under Muon (p<0.05).
 | relu2_s1 | 9 | −0.010 (mixed sign) | 0.57 ns |
 | selu | 2 | +0.114 | — |
 
-`sniqu` (eluquad self-normalized to zero mean / unit variance) significantly beats ReLU² under Muon. `relu2_s1` is a confirmed null. `selu`'s poor performance isolates the effect: quadratic curvature, not moment-matching alone, is what helps `sniqu`.
+`sniqu` (iqu self-normalized to zero mean / unit variance) significantly beats ReLU² under Muon. `relu2_s1` is a confirmed null. `selu`'s poor performance isolates the effect: quadratic curvature, not moment-matching alone, is what helps `sniqu`.
 
 **Under NorMuon — the production optimizer (1 seed, 5-LR sweep, 2000 steps):**
 

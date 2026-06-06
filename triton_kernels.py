@@ -411,7 +411,7 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
                                  ACT: tl.constexpr,   # 0 = relu(z)^2 ; 1 = relu(z)^2 + relu(z) (relu2_s1)
                                  ):
     dtype = tl.bfloat16
-    SNIQU_LAM = 0.56004    # ACT==2 sniqu: 0.560*(eluquad(z)-0.706), zero-mean/unit-var under N(0,1)
+    SNIQU_LAM = 0.56004    # ACT==2 sniqu: 0.560*(iqu(z)-0.706), zero-mean/unit-var under N(0,1)
     SNIQU_BETA = 0.70638
     start_pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)

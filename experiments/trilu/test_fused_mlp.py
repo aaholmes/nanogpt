@@ -5,8 +5,8 @@ kernel `linear_relu_square_kernel`. We add alternative activations selected by a
 
     ACT=0  relu2     post = relu(z)^2                 dpre = grad * 2*relu(z)
     ACT=1  relu2_s1  post = relu(z)^2 + relu(z)       dpre = grad * (2*relu(z) + 1[z>0])
-    ACT=2  sniqu     post = LAM*(eluquad(z) - BETA)   dpre = grad * LAM*eluquad'(z)
-           eluquad(z) = z+z^2 (z>=0) | z/(1-z) (z<0);  LAM=0.56004, BETA=0.70638
+    ACT=2  sniqu     post = LAM*(iqu(z) - BETA)       dpre = grad * LAM*iqu'(z)
+           iqu(z) = z+z^2 (z>=0) | z/(1-z) (z<0);  LAM=0.56004, BETA=0.70638
 
 Part A (CPU, fp64, default): pure-torch Function with the SAME manual backward algebra as the
     kernel, checked by gradcheck + against autograd through an eager reference. Proves the math.
@@ -32,7 +32,7 @@ def act_fwd(z, act):
     if act == 1:
         return pos * pos + pos
     neg = z - pos                              # = min(z, 0) <= 0
-    h = pos + pos * pos + neg / (1.0 - neg)    # eluquad
+    h = pos + pos * pos + neg / (1.0 - neg)    # iqu
     return LAM * (h - BETA)
 
 
