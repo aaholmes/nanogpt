@@ -1,5 +1,62 @@
 # Modded-NanoGPT
 
+## Fork: Activation function sweep — AdamW / Muon / NorMuon
+
+This fork investigates whether the MLP activation choice matters in the speedrun, and whether the answer depends on the optimizer. Short answer: **rankings are optimizer-dependent, and the production optimizer (NorMuon) makes activation choice largely irrelevant.**
+
+### What was tested
+
+Two MLP structures × several activations, all at 124M (nanogpt-small scale), local harness (RTX 5060 Ti), faithful config (Muon + Polar Express, torch.compile, chunked cross-entropy):
+
+- **Standard MLP** (`W₂·act(W₁x)`): ReLU², relu2_s1 (`ReLU(x)²+ReLU(x)`), iqu (`x+x²` / `x/(1−x)`), sniqu (iqu self-normalized to zero mean / unit variance), SELU
+- **Gated MLP** (`W₃·[act(W₁x)⊙(W₂x)]`): xglu, bilinear, reglu, dquad
+
+### Results
+
+**Under AdamW (51M pilot, 5 seeds):** gating wins by ~0.09 nats. Every gated MLP beats every standard MLP. The square-law gate `x|x|` leads.
+
+**Under Muon at 124M (4 seeds, paired t-tests):** the ranking reverses.
+
+| Activation | vs ReLU² | p-value |
+|-----------|----------|---------|
+| relu2_s1 | −0.057 | 0.19 (ns) |
+| iqu | −0.044 | 0.11 (ns) |
+| **relu2 (incumbent)** | baseline | — |
+| xglu (gated) | +0.098 | **0.024** |
+| bilinear (gated) | +0.103 | **0.025** |
+| reglu (gated) | +0.104 | **0.042** |
+| dquad (gated) | +0.162 | **0.013** |
+
+All four gated variants are significantly worse than ReLU² under Muon (p<0.05). The ~0.09 AdamW gating advantage flips to a ~0.10–0.16 penalty. A powered 9-seed grid then tested standard-MLP alternatives:
+
+| Activation | n | vs ReLU² (Δ) | p-value |
+|-----------|---|-------------|---------|
+| **sniqu** | 9 | **−0.076** (all seeds same sign) | **p<0.0001** |
+| relu2_s1 | 9 | −0.010 (mixed sign) | 0.57 ns |
+| selu | 2 | +0.114 | — |
+
+`sniqu` (Self-Normalizing Inverse-and-Quadratic Unit) significantly beats ReLU² under Muon. `relu2_s1` is a confirmed null. `selu`'s poor performance isolates the effect: quadratic curvature, not moment-matching alone, is what helps `sniqu`.
+
+**Under NorMuon — the production optimizer (1 seed, 5-LR sweep, 2000 steps):**
+
+| LR | relu2 | relu2_s1 | sniqu |
+|----|-------|----------|-------|
+| 0.02 ★ | **6.414** | 6.425 (+0.011) | 6.426 (+0.012) |
+
+All three variants converge to the same optimal LR (0.02, consistent with the record's 0.023) and land within 0.012 nats — indistinguishable within single-seed noise. The significant Muon advantage for `sniqu` does not survive NorMuon.
+
+### Conclusion
+
+**Activation-function and gating rankings are optimizer-dependent.** The entire activation canon (GELU, SwiGLU) was established under Adam-family optimizers; these results show those rankings do not reliably transfer to Muon or NorMuon. NorMuon's per-neuron variance normalization appears to make the optimizer intrinsically robust to activation scale and shape, washing out differences that are significant under plain Muon. No activation swap is worth pursuing for a record under the current stack.
+
+Two statistically solid findings, documented in detail in [`competition_strategy.html`](competition_strategy.html):
+1. Gating reverses significantly under Muon (p<0.05, n=4, all four gated variants worse by 0.10–0.16)
+2. sniqu beats ReLU² significantly under Muon (p<0.0001, n=9, Δ=−0.076) — but not under NorMuon
+
+Harness: [`experiments/trilu/phase1.py`](experiments/trilu/phase1.py). Real-stack kernel integration: [`triton_kernels.py`](triton_kernels.py), [`train_gpt.py`](train_gpt.py) (`NANOGPT_MLP_ACT` env flag). Rented-H100 A/B framework (unused): [`deploy/`](deploy/).
+
+---
+
 This repository hosts the *NanoGPT speedrun*, in which we (collaboratively|competitively) search for the fastest algorithm to use 8 NVIDIA H100 GPUs to train a language model that attains 3.28 cross-entropy loss on the [FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb) validation set.
 
 (Note: Besides the main track, there is also an [optimization track](records/track_3_optimization) where we try to minimize steps subject to fixed arch/data/bsz and with unlimited wallclock budget.)
@@ -386,65 +443,6 @@ compared to Shampoo.
 8. [Zhanchao Zhou et al. "Value Residual Learning For Alleviating Attention Concentration In Transformers." arXiv preprint arXiv:2410.17897 (2024).](https://arxiv.org/abs/2410.17897)
 9. [Team, Gemma, et al. "Gemma 2: Improving open language models at a practical size." arXiv preprint arXiv:2408.00118 (2024).](https://arxiv.org/abs/2408.00118)
 10. [Alec Radford et al. "Language models are unsupervised multitask learners." OpenAI blog 1.8 (2019).](https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf)
-
----
-
-## Fork: Activation function sweep — AdamW / Muon / NorMuon
-
-This fork investigates whether the MLP activation choice matters in the speedrun, and whether the answer depends on the optimizer. Short answer: **rankings are optimizer-dependent, and the production optimizer (NorMuon) makes activation choice largely irrelevant.**
-
-### What was tested
-
-Two MLP structures × several activations, all at 124M (nanogpt-small scale), local harness (RTX 5060 Ti), faithful config (Muon + Polar Express, torch.compile, chunked cross-entropy):
-
-- **Standard MLP** (`W₂·act(W₁x)`): ReLU², relu2_s1 (`ReLU(x)²+ReLU(x)`), iqu (`x+x²` / `x/(1−x)`), sniqu (iqu self-normalized to zero mean / unit variance), SELU
-- **Gated MLP** (`W₃·[act(W₁x)⊙(W₂x)]`): xglu, bilinear, reglu, dquad
-
-### Results
-
-**Under AdamW (51M pilot, 5 seeds):** gating wins by ~0.09 nats. Every gated MLP beats every standard MLP. The square-law gate `x|x|` leads.
-
-**Under Muon at 124M (4 seeds, paired t-tests):** the ranking reverses.
-
-| Variant | vs ReLU² | p-value |
-|---------|----------|---------|
-| relu2_s1 | −0.057 | 0.19 (ns) |
-| iqu | −0.044 | 0.11 (ns) |
-| **relu2 (incumbent)** | baseline | — |
-| xglu (gated) | +0.098 | **0.024** |
-| bilinear (gated) | +0.103 | **0.025** |
-| reglu (gated) | +0.104 | **0.042** |
-| dquad (gated) | +0.162 | **0.013** |
-
-All four gated variants are significantly worse than ReLU² under Muon (p<0.05). The ~0.09 AdamW gating advantage flips to a ~0.10–0.16 penalty. A powered 9-seed grid then tested standard-MLP alternatives:
-
-| Variant | n | vs ReLU² (Δ) | p-value |
-|---------|---|-------------|---------|
-| **sniqu** | 9 | **−0.076** (all seeds same sign) | **p<0.0001** |
-| relu2_s1 | 9 | −0.010 (mixed sign) | 0.57 ns |
-| selu | 2 | +0.114 | — |
-
-`sniqu` (iqu self-normalized to zero mean / unit variance) significantly beats ReLU² under Muon. `relu2_s1` is a confirmed null. `selu`'s poor performance isolates the effect: quadratic curvature, not moment-matching alone, is what helps `sniqu`.
-
-**Under NorMuon — the production optimizer (1 seed, 5-LR sweep, 2000 steps):**
-
-| LR | relu2 | relu2_s1 | sniqu |
-|----|-------|----------|-------|
-| 0.02 ★ | **6.414** | 6.425 (+0.011) | 6.426 (+0.012) |
-
-All three variants converge to the same optimal LR (0.02, consistent with the record's 0.023) and land within 0.012 nats — indistinguishable within single-seed noise. The significant Muon advantage for `sniqu` does not survive NorMuon.
-
-### Conclusion
-
-**Activation-function and gating rankings are optimizer-dependent.** The entire activation canon (GELU, SwiGLU) was established under Adam-family optimizers; these results show those rankings do not reliably transfer to Muon or NorMuon. NorMuon's per-neuron variance normalization appears to make the optimizer intrinsically robust to activation scale and shape, washing out differences that are significant under plain Muon. No activation swap is worth pursuing for a record under the current stack.
-
-Two statistically solid findings, documented in detail in [`competition_strategy.html`](competition_strategy.html):
-1. Gating reverses significantly under Muon (p<0.05, n=4, all four gated variants worse by 0.10–0.16)
-2. sniqu beats ReLU² significantly under Muon (p<0.0001, n=9, Δ=−0.076) — but not under NorMuon
-
-Harness: [`experiments/trilu/phase1.py`](experiments/trilu/phase1.py). Real-stack kernel integration: [`triton_kernels.py`](triton_kernels.py), [`train_gpt.py`](train_gpt.py) (`NANOGPT_MLP_ACT` env flag). Rented-H100 A/B framework (unused): [`deploy/`](deploy/).
-
----
 
 ## Citation
 

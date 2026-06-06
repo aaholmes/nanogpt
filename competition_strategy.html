@@ -68,7 +68,7 @@
 <h2>4. Results under AdamW</h2>
 <p>Final val loss, <strong>medium scale (51M), 5 seeds</strong> (lower = better). All gated variants use a linear gate unless noted. The 124M study (section 5) confirmed and extended these rankings under Muon.</p>
 <table>
-<tr><th>Variant</th><th>MLP / activation</th><th>Val loss</th></tr>
+<tr><th>Activation</th><th>MLP / activation</th><th>Val loss</th></tr>
 <tr><td><strong>xglu</strong></td><td>gated, <span class="formula">x + x|x|</span> (square-law)</td><td class="n"><strong>6.808</strong></td></tr>
 <tr><td>reglu</td><td>gated, ReLU&sup2;</td><td class="n">6.820</td></tr>
 <tr><td>bilinear</td><td>gated, none (<span class="formula">W&#8321;x &middot; W&#8322;x</span>)</td><td class="n">6.857</td></tr>
@@ -88,7 +88,7 @@
 <h2>5. The headline: it reverses under Muon</h2>
 <p>The benchmark uses Muon, so the decisive comparison is under it. At the faithful <strong>124M (nanogpt-small) scale with the real Polar-Express orthogonalizer</strong>, 4 seeds &times; 4000 steps, each variant at its own parabola-tuned learning rate:</p>
 <table>
-<tr><th>Variant (Muon, 124M)</th><th>MLP</th><th>Val loss</th><th>vs ReLU&sup2;</th></tr>
+<tr><th>Activation (Muon, 124M)</th><th>MLP</th><th>Val loss</th><th>vs ReLU&sup2;</th></tr>
 <tr><td><strong>relu2_s1</strong> &mdash; sloped ReLU&sup2; <span class="formula">x+x&sup2;</span></td><td>standard</td><td class="n"><strong>5.699</strong></td><td>&minus;0.057 (p=0.19)</td></tr>
 <tr><td>iqu &mdash; C&#178; piecewise: <span class="formula">x+x&sup2;</span> for x&ge;0, <span class="formula">x/(1&minus;x)</span> for x&lt;0 <span class="muted">(design rationale below)</span></td><td>standard</td><td class="n">5.712</td><td>&minus;0.044 (p&asymp;0.11)</td></tr>
 <tr><td>relu2 (incumbent)</td><td>standard</td><td class="n">5.756</td><td>baseline</td></tr>
@@ -115,7 +115,7 @@ Both are transcendental-free and fusable &mdash; genuine drop-in candidates with
 <li><code>selu</code> &mdash; the textbook self-normalizing activation, as a baseline. Near-<em>linear</em> on the positive side, so <code>selu</code> vs <code>sniqu</code> isolates whether the quadratic <em>curvature</em> helps or hurts once both are moment-matched.</li>
 </ul>
 <table>
-<tr><th>Variant (Muon, 124M)</th><th>seeds</th><th>mean val loss</th><th>at LR</th><th>vs relu2 (&Delta;)</th><th>p</th></tr>
+<tr><th>Activation (Muon, 124M)</th><th>seeds</th><th>mean val loss</th><th>at LR</th><th>vs relu2 (&Delta;)</th><th>p</th></tr>
 <tr><td><strong>sniqu</strong></td><td>9</td><td class="n"><strong>5.653</strong></td><td>0.01</td><td>&minus;0.076 (all 9 seeds same sign)</td><td><strong>p&lt;0.0001</strong></td></tr>
 <tr><td>relu2 (incumbent)</td><td>9</td><td class="n">5.729</td><td>0.005</td><td>baseline</td><td>&mdash;</td></tr>
 <tr><td>relu2_s1</td><td>9</td><td class="n">5.719</td><td>0.01</td><td>&minus;0.010 (mixed sign)</td><td>p=0.57 ns</td></tr>
@@ -141,7 +141,7 @@ Both are transcendental-free and fusable &mdash; genuine drop-in candidates with
 </table>
 <p>All three variants share the same optimal LR (<strong>0.02</strong>), consistent with the record's 0.023. At that LR:</p>
 <table>
-<tr><th>Variant (NorMuon, 124M, seed 0)</th><th>best val loss</th><th>&Delta; vs relu2</th></tr>
+<tr><th>Activation (NorMuon, 124M, seed 0)</th><th>best val loss</th><th>&Delta; vs relu2</th></tr>
 <tr><td>relu2 (incumbent)</td><td class="n">6.414</td><td>baseline</td></tr>
 <tr><td>relu2_s1</td><td class="n">6.425</td><td>+0.011</td></tr>
 <tr><td>sniqu</td><td class="n">6.426</td><td>+0.012</td></tr>
