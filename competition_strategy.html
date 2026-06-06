@@ -90,7 +90,7 @@
 <table>
 <tr><th>Variant (Muon, 124M)</th><th>MLP</th><th>Val loss</th><th>vs ReLU&sup2;</th></tr>
 <tr><td><strong>relu2_s1</strong> &mdash; sloped ReLU&sup2; <span class="formula">x+x&sup2;</span></td><td>standard</td><td class="n"><strong>5.699</strong></td><td>&minus;0.057 (p=0.19)</td></tr>
-<tr><td>eluquad &mdash; dense <span class="formula">x+x&sup2;</span> / <span class="formula">x/(1&minus;x)</span></td><td>standard</td><td class="n">5.712</td><td>&minus;0.044 (p&asymp;0.11)</td></tr>
+<tr><td>eluquad &mdash; C&#178; piecewise: <span class="formula">x+x&sup2;</span> for x&ge;0, <span class="formula">x/(1&minus;x)</span> for x&lt;0 <span class="muted">(design rationale below)</span></td><td>standard</td><td class="n">5.712</td><td>&minus;0.044 (p&asymp;0.11)</td></tr>
 <tr><td>relu2 (incumbent)</td><td>standard</td><td class="n">5.756</td><td>baseline</td></tr>
 <tr><td>xglu (<span class="formula">x|x|</span>)</td><td>gated</td><td class="n">5.854</td><td>+0.098 (p=0.024)</td></tr>
 <tr><td>bilinear</td><td>gated</td><td class="n">5.859</td><td>+0.103 (p=0.025)</td></tr>
@@ -104,14 +104,14 @@
 <strong>The leaders are same-cost standard MLPs.</strong> The top two are both 2-matmul standard MLPs that fix ReLU&sup2;'s gradient-starved origin:
 <ul>
 <li><code>relu2_s1</code> &mdash; squared-ReLU with a linear floor, <span class="formula">ReLU(x)&sup2;+ReLU(x)</span>. On final loss &minus;0.057 vs the incumbent (p=0.19, not yet significant), but on the <em>benchmark-relevant</em> metric &mdash; steps to reach a target loss &mdash; consistently ~10% faster <em>and far more stable</em> (hits val 5.9 at 2800&ndash;2900 steps every seed, vs ReLU&sup2;'s 2800&ndash;3400).</li>
-<li><code>eluquad</code> &mdash; the <em>dense</em> cousin: same <span class="formula">x+x&sup2;</span> for x&ge;0, but a smooth saturating tail <span class="formula">x/(1&minus;x)</span> for x&lt;0 instead of a hard zero. Removing ReLU&sup2;'s sparsity matches relu2_s1 within noise (&minus;0.044 vs incumbent) &mdash; mild evidence that, for a <em>standard</em> MLP, fixing the origin matters more than sparsity does.</li>
+<li><code>eluquad</code> &mdash; a C&#178; piecewise activation: quadratic-plus-linear (<span class="formula">x+x&sup2;</span>) for x&ge;0, giving curvature and a non-zero slope at the origin, and a smooth inverse (<span class="formula">x/(1&minus;x)</span>) for x&lt;0, giving a saturating negative tail with no dead zone or derivative kink. Matches relu2_s1 within noise (&minus;0.044 vs incumbent) &mdash; mild evidence that, for a <em>standard</em> MLP, fixing the origin matters more than sparsity. <span class="muted">(Shape and motivation in the derivation box below.)</span></li>
 </ul>
 Both are transcendental-free and fusable &mdash; genuine drop-in candidates with record upside (the powered grid below refines this ranking and adds <code>sniqu</code>).
 </div>
 <div class="box">
 <strong>Powered grid (Muon, 124M, up to 9 seeds).</strong> The section-5 study tested gated vs standard MLPs. Separately, we screened two principled newcomers against relu2 at their own-optimum LRs:
 <ul>
-<li><code>sniqu</code> (<em>Self-Normalizing Inverse-and-Quadratic Union</em>) &mdash; <code>eluquad</code> given the <strong>SELU treatment</strong>: rescaled and shifted to be exactly zero-mean / unit-variance under Gaussian input, fixing the ~1.8&times; residual-stream inflation raw eluquad causes. Keeps the quadratic curvature. (Derivation and shape below.)</li>
+<li><code>sniqu</code> (<em>Self-Normalizing Inverse-and-Quadratic Union</em>) &mdash; a C&#178; activation with a quadratic positive branch (<span class="formula">x+x&sup2;</span> for x&ge;0) and a smooth inverse negative branch (<span class="formula">x/(1&minus;x)</span> for x&lt;0), with an affine rescaling chosen by Gauss&ndash;Hermite quadrature so that for Gaussian inputs the output is <em>exactly</em> zero-mean and unit-variance. This is the same self-normalization recipe as SELU, here applied to a shape with quadratic curvature. (Full derivation and motivation below.)</li>
 <li><code>selu</code> &mdash; the textbook self-normalizing activation, as a baseline. Near-<em>linear</em> on the positive side, so <code>selu</code> vs <code>sniqu</code> isolates whether the quadratic <em>curvature</em> helps or hurts once both are moment-matched.</li>
 </ul>
 <table>
@@ -119,7 +119,7 @@ Both are transcendental-free and fusable &mdash; genuine drop-in candidates with
 <tr><td><strong>sniqu</strong></td><td>9</td><td class="n"><strong>5.653</strong></td><td>0.01</td><td>&minus;0.076 (all 9 seeds same sign)</td><td><strong>p&lt;0.0001</strong></td></tr>
 <tr><td>relu2 (incumbent)</td><td>9</td><td class="n">5.729</td><td>0.005</td><td>baseline</td><td>&mdash;</td></tr>
 <tr><td>relu2_s1</td><td>9</td><td class="n">5.719</td><td>0.01</td><td>&minus;0.010 (mixed sign)</td><td>p=0.57 ns</td></tr>
-<tr><td>eluquad</td><td>2</td><td class="n">5.706</td><td>0.01</td><td>&minus;0.014 (consistent)</td><td>n=2, no test</td></tr>
+<tr><td>eluquad <span class="muted">(C&#178; quadratic/inverse; see above)</span></td><td>2</td><td class="n">5.706</td><td>0.01</td><td>&minus;0.014 (consistent)</td><td>n=2, no test</td></tr>
 <tr><td>selu</td><td>2</td><td class="n">5.833</td><td>0.01</td><td>+0.114 (consistent)</td><td>n=2, no test</td></tr>
 </table>
 <div class="good" style="margin-top:0.8em">
