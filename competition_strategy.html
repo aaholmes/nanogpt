@@ -97,11 +97,11 @@
 </div>
 
 <h2>5. The headline: rankings reverse under Muon</h2>
-<p>Mean validation cross-entropy at 4000 steps, <strong>124M scale</strong> (12 layers, width 768), each activation at its own best LR from a 4-point log-spaced grid probe (2 seeds per point; best grid point selected), batch 16, seq 1024. Standard MLPs (2 matmuls) and gated MLPs (3 matmuls) are shown together; significance via paired t-test against relu2 as the baseline. iqu result at n=9 is pending.</p>
+<p>Mean validation cross-entropy at 4000 steps, <strong>124M scale</strong> (12 layers, width 768), each activation at its own best LR from a 4-point log-spaced grid probe (2 seeds per point; best grid point selected), batch 16, seq 1024. Standard MLPs (2 matmuls) and gated MLPs (3 matmuls) are shown together; significance via paired t-test against relu2 as the baseline.</p>
 <table>
 <tr><th>Activation</th><th>MLP</th><th>n</th><th>Mean val loss</th><th>&Delta; vs ReLU&sup2;</th><th>p</th></tr>
 <tr><td><strong>sniqu</strong> &mdash; Self-Normalizing IQU <span class="muted">(derivation below)</span></td><td>standard</td><td>9</td><td class="n"><strong>5.653</strong></td><td><strong>&minus;0.076</strong> (all 9 seeds)</td><td><strong>p&lt;0.0001</strong></td></tr>
-<tr><td>iqu &mdash; <span class="formula">x+x&sup2;</span> / <span class="formula">x/(1&minus;x)</span> <span class="muted">(derivation below)</span></td><td>standard</td><td>2*</td><td class="n">5.706</td><td>&minus;0.014 (consistent)</td><td><em>pending n=9</em></td></tr>
+<tr><td>iqu &mdash; <span class="formula">x+x&sup2;</span> / <span class="formula">x/(1&minus;x)</span> <span class="muted">(derivation below)</span></td><td>standard</td><td>9</td><td class="n">5.713</td><td>&minus;0.002 (mixed sign)</td><td>0.88 ns</td></tr>
 <tr><td>relu2_s1 &mdash; <span class="formula">ReLU(x)&sup2;+ReLU(x)</span></td><td>standard</td><td>9</td><td class="n">5.719</td><td>&minus;0.010 (mixed sign)</td><td>0.57 ns</td></tr>
 <tr><td>relu2 &mdash; ReLU&sup2; (record incumbent)</td><td>standard</td><td>9</td><td class="n">5.729</td><td>baseline</td><td>&mdash;</td></tr>
 <tr><td>selu</td><td>standard</td><td>2*</td><td class="n">5.833</td><td>+0.114</td><td><em>clearly worse</em></td></tr>
@@ -110,12 +110,12 @@
 <tr><td>reglu &mdash; gated, ReLU&sup2;</td><td>gated</td><td>4</td><td class="n">5.860</td><td>+0.104</td><td>0.042</td></tr>
 <tr><td>dquad &mdash; gated, double-quadratic</td><td>gated</td><td>4</td><td class="n">5.918</td><td>+0.162</td><td>0.013</td></tr>
 </table>
-<p class="muted">* n=2 seeds; sufficient to flag selu as clearly worse and iqu as promising, but formal significance test pending. Gated variants and standard MLPs come from two paired sub-studies sharing the same random seeds.</p>
+<p class="muted">* selu n=2 seeds — sufficient to flag as clearly worse, not powered for a formal test. Gated variants and standard MLPs come from two paired sub-studies sharing the same random seeds.</p>
 <div class="warn">
 <strong>Gating reverses from a win to a significant loss.</strong> Under AdamW gating beat standard ReLU&sup2; by ~0.09 nats; under Muon at 124M all four gated activations are <strong>0.10&ndash;0.16 nats worse, each p&lt;0.05</strong>. The gap grew with scale (it was a near-tie at 51M), so at the real benchmark size gating is more clearly wrong, not less &mdash; and it costs more (three matmuls vs two).
 </div>
 <div class="good">
-<strong>sniqu significantly beats relu2 under Muon</strong> (p&lt;0.0001, n=9, 95% CI [&minus;0.097, &minus;0.056], all 9 seeds same direction). It is the only standard-MLP activation that robustly beats the incumbent. <code>relu2_s1</code> is a confirmed null (p=0.57); its earlier 4-seed signal was noise. <code>selu</code> is clearly worse, which isolates the cause: the quadratic positive-branch curvature in sniqu does the work &mdash; self-normalization alone (SELU) is not enough. (Derivation of iqu and sniqu below.)
+<strong>sniqu significantly beats relu2 under Muon</strong> (p&lt;0.0001, n=9, 95% CI [&minus;0.097, &minus;0.056], all 9 seeds same direction). It is the only standard-MLP activation that robustly beats the incumbent. <code>relu2_s1</code> is a confirmed null (p=0.57) and <code>iqu</code> is a confirmed null (p=0.88, n=9, mixed signs) &mdash; the activation shape alone does not help. <code>selu</code> is clearly worse. Together these form a clean 2&times;2: shape change alone (iqu) fails; moment-matching alone (selu) fails; only their combination (sniqu) wins. Self-normalization is the active ingredient. (Derivation of iqu and sniqu below.)
 </div>
 
 <div class="box">
