@@ -46,7 +46,7 @@
 <body>
 
 <h1>Do better MLP activations help in Modded-NanoGPT — and does the answer depend on the optimizer?</h1>
-<p class="muted">Working notes. Private fork of <code>KellerJordan/modded-nanogpt</code>. Author: Adam Holmes. Status: 9-seed powered grid complete &mdash; sniqu beats relu2 under Muon (p&lt;0.0001, n=9, all seeds same direction); NorMuon pre-screen shows the advantage does not survive the production optimizer. Gate-3: NO-GO.</p>
+<p class="muted">Private fork of <code>KellerJordan/modded-nanogpt</code>. Author: Adam Holmes. Study complete: activation rankings are optimizer-dependent. Two statistically significant findings under Muon; both effects wash out under NorMuon (the production optimizer). No record-level intervention identified.</p>
 
 <h2>1. Background</h2>
 <p><a href="https://github.com/KellerJordan/modded-nanogpt">Modded-NanoGPT</a> is a community <em>speedrun</em>: train a ~124M-parameter GPT on the FineWeb text dataset to a fixed validation loss (cross-entropy ≤ 3.28 nats/token) as fast as possible on a fixed 8&times;H100 node. The data and target are frozen; everything else (architecture, optimizer, schedule) is fair game. The current record is ~1.4 minutes. The modern record stack uses the <strong>Muon</strong> optimizer, FP8 matmuls, sliding-window attention, and a <strong>ReLU&sup2;</strong> activation (<span class="formula">max(0,x)&sup2;</span>) in its MLP blocks.</p>
@@ -57,7 +57,7 @@
 <div class="box">
 <strong>Model:</strong> decoder-only GPT. Two scales used: <em>medium</em> (51M: 8 layers, width 512) for fast pilots, and <em>small</em> (124M: 12 layers, width 768, 6 heads) matching the real nanogpt-small, for the faithful study.<br>
 <strong>Optimizers:</strong> <em>AdamW</em> (per-parameter adaptive), <em>Muon</em> (orthogonalizes each weight-matrix update via the real "Polar Express" iteration), and <em>NorMuon</em> (Muon + the record's neuron-wise variance normalization).<br>
-<strong>Training:</strong> bf16, sequence length 1024, batch 16, 3000–4000 steps, <strong>4–5 seeds per variant</strong>. All variants share seeds, so comparisons are <em>paired</em> (the per-seed loss difference has tiny noise, ~0.004, even though run-to-run loss varies ~0.05).<br>
+<strong>Training:</strong> bf16, sequence length 1024, batch 16, 4000 steps, <strong>4–9 seeds per variant</strong> (9 for the primary sniqu comparison). All variants share seeds, so comparisons are <em>paired</em> (the per-seed loss difference has tiny noise, ~0.004, even though run-to-run loss varies ~0.05).<br>
 <strong>Metric:</strong> mean validation cross-entropy on FineWeb (nats/token; lower is better), reported as the seed-mean of the final loss, plus steps-to-reach-a-target-loss (how the speedrun is actually scored). Significance via paired t-tests.<br>
 <strong>Faithful to the benchmark:</strong> model size, Muon + Polar Express, torch.compile, chunked cross-entropy. <strong>Not</strong> included: FP8, value embeddings, sliding-window attention, the real 896→2048 data schedule. So it is a clean ranking instrument; real-benchmark validation needs rented H100s.
 </div>
@@ -66,7 +66,7 @@
 <p>The MLP block is either <strong>standard</strong> (<span class="formula">W&#8322;&middot;act(W&#8321;x)</span>) or <strong>gated</strong> (<span class="formula">W&#8323;&middot;[act(W&#8321;x) &odot; (W&#8322;x)]</span> — two linear projections multiplied, one passed through an activation; the basis of SwiGLU/GeGLU in modern LLMs). Activations tested: ReLU&sup2;, GELU, SiLU, <span class="formula">x|x|</span> (signed square), bilinear (no activation — the gate is just a second linear branch), and variants with a learnable slope/curvature. (A piecewise-quadratic GELU-approximator, "TriLU," was our original hypothesis; it was the <em>worst</em> variant tried and is not discussed further.)</p>
 
 <h2>4. Results under AdamW</h2>
-<p>Final val loss, <strong>medium scale (51M), 5 seeds</strong> (lower = better). All gated variants use a linear gate unless noted. (The faithful 124M re-run is in progress; these orderings are the pilot.)</p>
+<p>Final val loss, <strong>medium scale (51M), 5 seeds</strong> (lower = better). All gated variants use a linear gate unless noted. The 124M study (section 5) confirmed and extended these rankings under Muon.</p>
 <table>
 <tr><th>Variant</th><th>MLP / activation</th><th>Val loss</th></tr>
 <tr><td><strong>xglu</strong></td><td>gated, <span class="formula">x + x|x|</span> (square-law)</td><td class="n"><strong>6.808</strong></td></tr>
@@ -184,7 +184,7 @@ Both are transcendental-free and fusable &mdash; genuine drop-in candidates with
 
 <div class="footer">
 Harness: <code>experiments/trilu/phase1.py</code> (+ <code>significance.py</code>, <code>pick_lr.py</code>, <code>steps_to_target.py</code>). Kernel validation: <code>experiments/trilu/test_fused_mlp.py</code>. Real-stack integration + rented-H100 A/B: <code>train_gpt.py</code>, <code>triton_kernels.py</code>, <code>deploy/</code>.<br>
-Working document — numbers are from the local ranking harness, not the official benchmark; revisit as the faithful study completes.
+All numbers are from the local ranking harness (RTX 5060 Ti), not the official 8&times;H100 benchmark. Study complete as of June 2026.
 </div>
 
 </body>
