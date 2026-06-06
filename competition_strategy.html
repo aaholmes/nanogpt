@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Activations &amp; Optimizers in Modded-NanoGPT</title>
+<title>NanoGPT Speedrun: Activation Rankings Depend on the Optimizer</title>
 <style>
   :root {
     --fg: #1a1a1a;
@@ -45,8 +45,17 @@
 </head>
 <body>
 
-<h1>Do better MLP activations help in Modded-NanoGPT — and does the answer depend on the optimizer?</h1>
-<p class="muted">Private fork of <code>KellerJordan/modded-nanogpt</code>. Author: Adam Holmes. Study complete: activation rankings are optimizer-dependent. Two statistically significant findings under Muon; both effects wash out under NorMuon (the production optimizer). No record-level intervention identified.</p>
+<h1>NanoGPT Speedrun: Activation Rankings Depend on the Optimizer</h1>
+<p class="muted">Adam Holmes &middot; June 2026 &middot; <a href="https://github.com/KellerJordan/modded-nanogpt">modded-nanogpt</a> fork</p>
+
+<div class="good">
+<strong>Key findings</strong> — two statistically significant results from 124M-parameter training runs under Muon + Polar Express:
+<ol style="margin:0.5em 0 0.3em">
+<li><strong>Gated MLPs reverse from best to worst when switching AdamW &rarr; Muon.</strong> Under AdamW, gating beats standard MLPs by ~0.09 nats. Under Muon, all four gated variants are significantly <em>worse</em> (p&lt;0.05, n=4, &Delta; = +0.10 to +0.16 nats).</li>
+<li><strong>SNIQU significantly beats ReLU&sup2; under Muon</strong> (p&lt;0.0001, n=9, &Delta;&nbsp;=&nbsp;&minus;0.076 nats, all 9 seeds same direction). SNIQU is a new C&sup2; activation with a quadratic positive branch and a smooth inverse negative branch, self-normalized to zero mean and unit variance under Gaussian input &mdash; details below.</li>
+</ol>
+<strong>Both effects vanish under NorMuon</strong> (the production optimizer): all standard-MLP activations land within 0.012 nats of each other at the same optimal LR. Activation choice appears to matter less as the optimizer becomes more robust to scale and conditioning.
+</div>
 
 <h2>1. Background</h2>
 <p><a href="https://github.com/KellerJordan/modded-nanogpt">Modded-NanoGPT</a> is a community <em>speedrun</em>: train a ~124M-parameter GPT on the FineWeb text dataset to a fixed validation loss (cross-entropy ≤ 3.28 nats/token) as fast as possible on a fixed 8&times;H100 node. The data and target are frozen; everything else (architecture, optimizer, schedule) is fair game. The current record is ~1.4 minutes. The modern record stack uses the <strong>Muon</strong> optimizer, FP8 matmuls, sliding-window attention, and a <strong>ReLU&sup2;</strong> activation (<span class="formula">max(0,x)&sup2;</span>) in its MLP blocks.</p>
