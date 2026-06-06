@@ -940,6 +940,7 @@ def main():
                     help="adamw (default); muon (orthogonalized momentum on the hidden matrices, "
                          "AdamW on embeddings/norms); normuon (muon + neuron-wise variance "
                          "normalization -- the real record's optimizer, arXiv 2510.05491).")
+    ap.add_argument("--lr", type=float, default=None, help="AdamW base learning rate override (default: use config value, 3e-4).")
     ap.add_argument("--muon-lr", type=float, default=0.02, help="base LR for the Muon/NorMuon group.")
     ap.add_argument("--muon-beta2", type=float, default=0.9,
                     help="NorMuon second-moment EMA decay (only used with --optimizer normuon).")
@@ -976,6 +977,8 @@ def main():
     cfg_base["compile"] = args.compile
     cfg_base["ce_chunk"] = args.ce_chunk
     cfg_base["optimizer"] = args.optimizer
+    if args.lr is not None:
+        cfg_base["lr"] = args.lr
     cfg_base["muon_lr"] = args.muon_lr
     cfg_base["muon_beta2"] = args.muon_beta2
     cfg_base["muon_ortho"] = args.muon_ortho

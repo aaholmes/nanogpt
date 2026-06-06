@@ -15,43 +15,27 @@ Two MLP structures × several activations, all at 124M (nanogpt-small scale), lo
 
 **Under AdamW (51M pilot, 5 seeds):** gating wins by ~0.09 nats. Every gated MLP beats every standard MLP. The square-law gate `x|x|` leads.
 
-**Under Muon at 124M (4 seeds, paired t-tests):** the ranking reverses.
-
-| Activation | vs ReLU² | p-value |
-|-----------|----------|---------|
-| relu2_s1 | −0.057 | 0.19 (ns) |
-| iqu | −0.044 | 0.11 (ns) |
-| **relu2 (incumbent)** | baseline | — |
-| xglu (gated) | +0.098 | **0.024** |
-| bilinear (gated) | +0.103 | **0.025** |
-| reglu (gated) | +0.104 | **0.042** |
-| dquad (gated) | +0.162 | **0.013** |
-
-All four gated variants are significantly worse than ReLU² under Muon (p<0.05). The ~0.09 AdamW gating advantage flips to a ~0.10–0.16 penalty. A powered 9-seed grid then tested standard-MLP alternatives:
+**Under Muon at 124M (paired t-tests):** the ranking reverses. All four gated variants are significantly worse than ReLU² (p<0.05, n=4, Δ = +0.10 to +0.16 nats). Among standard MLPs:
 
 | Activation | n | vs ReLU² (Δ) | p-value |
 |-----------|---|-------------|---------|
 | **sniqu** | 9 | **−0.076** (all seeds same sign) | **p<0.0001** |
 | relu2_s1 | 9 | −0.010 (mixed sign) | 0.57 ns |
-| selu | 2 | +0.114 | — |
+| relu2 (incumbent) | 9 | baseline | — |
+| xglu (gated) | 4 | +0.098 | 0.024 |
+| reglu (gated) | 4 | +0.104 | 0.042 |
+| dquad (gated) | 4 | +0.162 | 0.013 |
 
-`sniqu` (Self-Normalizing Inverse-and-Quadratic Unit) significantly beats ReLU² under Muon. `relu2_s1` is a confirmed null. `selu`'s poor performance isolates the effect: quadratic curvature, not moment-matching alone, is what helps `sniqu`.
+`sniqu` (Self-Normalizing Inverse-and-Quadratic Unit) significantly beats ReLU² under Muon. `relu2_s1` is a confirmed null. `selu` (+0.114, n=2) is clearly worse, isolating the effect: quadratic curvature, not moment-matching alone, drives the `sniqu` gain.
 
-**Under NorMuon — the production optimizer (1 seed, 5-LR sweep, 2000 steps):**
-
-| LR | relu2 | relu2_s1 | sniqu |
-|----|-------|----------|-------|
-| 0.02 ★ | **6.414** | 6.425 (+0.011) | 6.426 (+0.012) |
-
-All three variants converge to the same optimal LR (0.02, consistent with the record's 0.023) and land within 0.012 nats — indistinguishable within single-seed noise. The significant Muon advantage for `sniqu` does not survive NorMuon.
+**Under NorMuon — the production optimizer:** a single-seed 5-LR sweep found all three standard-MLP activations within 0.012 nats at the same optimal LR (0.02), suggesting the Muon advantage may not persist. A powered multi-seed NorMuon study is underway.
 
 ### Conclusion
 
-**Activation-function and gating rankings are optimizer-dependent.** The entire activation canon (GELU, SwiGLU) was established under Adam-family optimizers; these results show those rankings do not reliably transfer to Muon or NorMuon. NorMuon's per-neuron variance normalization appears to make the optimizer intrinsically robust to activation scale and shape, washing out differences that are significant under plain Muon. No activation swap is worth pursuing for a record under the current stack.
+**Activation-function and gating rankings are optimizer-dependent.** The entire activation canon (GELU, SwiGLU) was established under Adam-family optimizers; these results show those rankings do not reliably transfer to Muon. Two statistically solid findings, documented in detail in [`competition_strategy.html`](competition_strategy.html):
 
-Two statistically solid findings, documented in detail in [`competition_strategy.html`](competition_strategy.html):
-1. Gating reverses significantly under Muon (p<0.05, n=4, all four gated variants worse by 0.10–0.16)
-2. sniqu beats ReLU² significantly under Muon (p<0.0001, n=9, Δ=−0.076) — but not under NorMuon
+1. Gating reverses significantly under Muon (p<0.05, n=4, all four gated variants worse by 0.10–0.16 nats)
+2. sniqu beats ReLU² significantly under Muon (p<0.0001, n=9, Δ=−0.076, all seeds same direction)
 
 Harness: [`experiments/trilu/phase1.py`](experiments/trilu/phase1.py). Real-stack kernel integration: [`triton_kernels.py`](triton_kernels.py), [`train_gpt.py`](train_gpt.py) (`NANOGPT_MLP_ACT` env flag). Rented-H100 A/B framework (unused): [`deploy/`](deploy/).
 
