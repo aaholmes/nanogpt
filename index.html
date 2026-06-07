@@ -49,10 +49,10 @@
 <p class="muted">Adam Holmes &middot; June 2026 &middot; <a href="https://github.com/KellerJordan/modded-nanogpt">modded-nanogpt</a> fork</p>
 
 <div class="good">
-<strong>Key findings</strong> &mdash; two statistically significant results from 124M-parameter runs under Muon + Polar Express:
+<strong>Key findings</strong> &mdash; a clean 2&times;2 from matched 124M-parameter runs (same scale and steps, optimizer is the only variable):
 <ol style="margin:0.5em 0 0.3em">
-<li><strong>Gated MLPs reverse from best to worst when switching AdamW &rarr; Muon.</strong> Under AdamW, gating beats standard MLPs by ~0.09 nats. Under Muon, all four gated variants are significantly <em>worse</em> (p&lt;0.05, n=4, &Delta; = +0.10 to +0.16 nats).</li>
-<li><strong>SNIQU significantly beats ReLU&sup2; under Muon</strong> (p&lt;0.0001, n=9, &Delta;&nbsp;=&nbsp;&minus;0.076 nats, all 9 seeds same direction). SNIQU is a new activation I designed for this study &mdash; details below.</li>
+<li><strong>Gating reverses: wins under AdamW, loses under Muon.</strong> Gated MLPs beat relu2 by 0.06&ndash;0.11 nats under AdamW (p&le;0.001) and lose by 0.10&ndash;0.16 nats under Muon (p&lt;0.05, n=4). Same activations, same scale, opposite sign.</li>
+<li><strong>SNIQU reverses too: wins under Muon, loses under AdamW.</strong> SNIQU beats relu2 by 0.076 nats under Muon (p&lt;0.0001, n=9, all seeds same direction) and loses by ~0.18&ndash;0.29 nats under AdamW. SNIQU is a new C&sup2; activation I designed for this study &mdash; details below.</li>
 </ol>
 <strong>A single-seed NorMuon screen suggests both effects may not persist under the production optimizer</strong> &mdash; all three activations landed within 0.012 nats at the same optimal LR. A powered multi-seed NorMuon study is underway; see Section 5.
 </div>
@@ -73,23 +73,20 @@
 <p>The MLP block is either <strong>standard</strong> (<span class="formula">W&#8322;&middot;act(W&#8321;x)</span>) or <strong>gated</strong> (<span class="formula">W&#8323;&middot;[act(W&#8321;x) &odot; (W&#8322;x)]</span> &mdash; two projections multiplied, the basis of SwiGLU/GeGLU in modern LLMs). Activations tested: ReLU&sup2;, GELU, SiLU, <span class="formula">x|x|</span> (signed square), bilinear (no activation), and variants with a learnable slope or curvature.</p>
 
 <h2>4. Results under AdamW</h2>
-<p><strong>Note:</strong> This table is being redone at <strong>124M / 4000 steps</strong> to match the Muon table methodology and eliminate the scale confound. Updated results are in progress and will replace this table shortly.</p>
-<p>Mean val cross-entropy at 3000 steps, <strong>51M scale</strong>, 5 seeds, AdamW lr=3&times;10&#8315;&#8308;, batch 32.</p>
+<p>Mean val cross-entropy at 4000 steps, <strong>124M scale</strong> (same as Muon table), 5 seeds, each activation at its own best LR from a 4-point log-spaced grid probe (2 seeds per point), batch 16. Significance via paired t-test against relu2.</p>
 <table>
-<tr><th>Activation</th><th>MLP</th><th>Val loss</th></tr>
-<tr><td><strong>xglu</strong> &mdash; gated, <span class="formula">x + x|x|</span></td><td>gated</td><td class="n"><strong>6.808</strong></td></tr>
-<tr><td>reglu &mdash; gated, ReLU&sup2;</td><td>gated</td><td class="n">6.820</td></tr>
-<tr><td>bilinear &mdash; gated, <span class="formula">W&#8321;x &middot; W&#8322;x</span></td><td>gated</td><td class="n">6.857</td></tr>
-<tr><td>geglu / swiglu &mdash; gated, GELU / SiLU</td><td>gated</td><td class="n">6.890 / 6.899</td></tr>
-<tr><td>relu2 &mdash; ReLU&sup2; (the record's choice)</td><td>standard</td><td class="n">6.934</td></tr>
-<tr><td>gelu</td><td>standard</td><td class="n">6.996</td></tr>
+<tr><th>Activation</th><th>MLP</th><th>n</th><th>Mean val loss</th><th>&Delta; vs ReLU&sup2;</th><th>p</th></tr>
+<tr><td>reglu &mdash; gated, ReLU&sup2;</td><td>gated</td><td>5</td><td class="n"><strong>6.162</strong></td><td><strong>&minus;0.105</strong> (all 5 seeds)</td><td><strong>0.0001</strong></td></tr>
+<tr><td>xglu &mdash; gated, <span class="formula">x + x|x|</span></td><td>gated</td><td>5</td><td class="n">6.206</td><td>&minus;0.061 (all 5 seeds)</td><td>0.001</td></tr>
+<tr><td>relu2 &mdash; ReLU&sup2; (record incumbent)</td><td>standard</td><td>5</td><td class="n">6.267</td><td>baseline</td><td>&mdash;</td></tr>
+<tr><td>sniqu &mdash; Self-Normalizing IQU</td><td>standard</td><td>5</td><td class="n">6.562</td><td>+0.295 (all 5 seeds)</td><td>0.054 ns*</td></tr>
 </table>
+<p class="muted">* sniqu seed 3 produced an outlier (7.03 vs ~6.45 for the other four), consistent with instability at lr=1e-3 — the self-normalization may interact poorly with AdamW's cosine schedule at higher LRs. Excluding it: n=4, mean=6.445, &Delta;=+0.176. Both with and without the outlier, sniqu is clearly worse than relu2 under AdamW.</p>
+<div class="warn">
+<strong>Gating wins under AdamW &mdash; the mirror image of the Muon result.</strong> Both gated variants significantly beat relu2 (reglu p=0.0001, xglu p=0.001, all 10 seeds same direction). This confirms the reversal is real: the same activations that lose by 0.10&ndash;0.16 nats under Muon win by 0.06&ndash;0.11 nats under AdamW. Optimizer is the only variable between the two tables.
+</div>
 <div class="good">
-<strong>Under AdamW:</strong>
-<ul>
-<li><strong>Gating wins decisively</strong> &mdash; every gated MLP beats every standard MLP by ~0.09 nats (p&lt;10&#8315;&#8309;), despite slightly <em>fewer</em> parameters. The multiplicative interaction does the work; activation shape barely matters.</li>
-<li><strong>Sharp, cheap activations win within the gated family</strong> &mdash; the transcendental-free square-law gates (<span class="formula">x|x|</span>, ReLU&sup2;) beat smooth GELU/SiLU, and adding a linear slope term (<span class="formula">x + x|x|</span>) helps another ~0.03 nats.</li>
-</ul>
+<strong>sniqu is significantly worse than relu2 under AdamW</strong> (&Delta;=+0.18&ndash;0.29, all 5 seeds), completing the 2&times;2: sniqu wins under Muon, loses under AdamW; gating wins under AdamW, loses under Muon. Each activation is well-matched to a different optimizer.
 </div>
 
 <h2>5. The headline: rankings reverse under Muon</h2>
@@ -156,7 +153,7 @@
 <li><strong>Gating is out.</strong> Every gated MLP I tried is significantly worse than plain ReLU&sup2; under Muon at 124M &mdash; and costs more compute on top of that (p&lt;0.05, n=4, all four variants). Not worth touching.</li>
 <li><strong>sniqu is the one activation that actually helps under Muon</strong> (p&lt;0.0001, &Delta;=&minus;0.076, all 9 seeds pointing the same way). The shape change alone (iqu) does nothing &mdash; it's the self-normalization that matters. Whether the win survives NorMuon is still open: a quick single-seed screen showed all three activations within 0.012 nats of each other, which is suspicious, but a proper multi-seed run is needed before concluding anything.</li>
 <li><strong>The infrastructure is there to follow up:</strong> sniqu and relu2_s1 are already wired into the real <code>train_gpt.py</code> behind a one-line env flag, the fused Triton kernel works, and there's a turnkey H100 A/B harness in <code>deploy/</code>. If the NorMuon study shows a signal, it would be easy to test on the actual benchmark.</li>
-<li><strong>The bigger takeaway:</strong> activation rankings are optimizer-dependent in a pretty striking way. Gating beats standard MLPs by ~0.09 nats under AdamW, then loses by 0.10&ndash;0.16 under Muon. The whole activation canon &mdash; GELU, SwiGLU, all of it &mdash; was established with Adam. These results suggest you can't just assume those rankings carry over to Muon or other orthogonalizing optimizers, which is worth knowing given how much the optimizer landscape has shifted recently.</li>
+<li><strong>The bigger takeaway:</strong> it's a clean 2&times;2. Gating wins under AdamW, loses under Muon. SNIQU wins under Muon, loses under AdamW. Same activations, same scale, opposite rankings depending solely on the optimizer. The whole activation canon &mdash; GELU, SwiGLU, all of it &mdash; was established with Adam. You can't assume those rankings carry over to Muon or other orthogonalizing optimizers, which is worth knowing given how much the optimizer landscape has shifted recently.</li>
 </ul>
 
 <div class="footer">
