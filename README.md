@@ -32,7 +32,7 @@ Two MLP structures × several activations, all at 124M (nanogpt-small scale), lo
 
 ### Conclusion
 
-**Activation-function and gating rankings are optimizer-dependent.** The entire activation canon (GELU, SwiGLU) was established under Adam-family optimizers; these results show those rankings do not reliably transfer to Muon. Two statistically solid findings, documented in detail in [`competition_strategy.html`](competition_strategy.html):
+**Activation-function and gating rankings are optimizer-dependent.** The entire activation canon (GELU, SwiGLU) was established under Adam-family optimizers; these results show those rankings do not reliably transfer to Muon. Two statistically solid findings, documented in detail in [`index.html`](index.html):
 
 1. Gating reverses significantly under Muon (p<0.05, n=4, all four gated variants worse by 0.10–0.16 nats)
 2. sniqu beats ReLU² significantly under Muon (p<0.0001, n=9, Δ=−0.076, all seeds same direction)

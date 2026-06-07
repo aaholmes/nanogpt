@@ -72,7 +72,7 @@
 </div>
 
 <h2>3. What we compared</h2>
-<p>The MLP block is either <strong>standard</strong> (<span class="formula">W&#8322;&middot;act(W&#8321;x)</span>) or <strong>gated</strong> (<span class="formula">W&#8323;&middot;[act(W&#8321;x) &odot; (W&#8322;x)]</span> — two linear projections multiplied, one passed through an activation; the basis of SwiGLU/GeGLU in modern LLMs). Activations tested: ReLU&sup2;, GELU, SiLU, <span class="formula">x|x|</span> (signed square), bilinear (no activation — the gate is just a second linear branch), and variants with a learnable slope/curvature. (A piecewise-quadratic GELU-approximator, "TriLU," was our original hypothesis; it was the <em>worst</em> variant tried and is not discussed further.)</p>
+<p>The MLP block is either <strong>standard</strong> (<span class="formula">W&#8322;&middot;act(W&#8321;x)</span>) or <strong>gated</strong> (<span class="formula">W&#8323;&middot;[act(W&#8321;x) &odot; (W&#8322;x)]</span> — two linear projections multiplied, one passed through an activation; the basis of SwiGLU/GeGLU in modern LLMs). Activations tested: ReLU&sup2;, GELU, SiLU, <span class="formula">x|x|</span> (signed square), bilinear (no activation — the gate is just a second linear branch), and variants with a learnable slope/curvature.</p>
 
 <h2>4. Results under AdamW</h2>
 <p><strong>Note:</strong> This table is being redone at <strong>124M / 4000 steps</strong> to match the Muon table methodology and eliminate the scale confound. Updated results for relu2, sniqu, xglu, and reglu are in progress and will replace this table shortly.</p>
