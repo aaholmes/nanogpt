@@ -75,7 +75,8 @@
 <p>The MLP block is either <strong>standard</strong> (<span class="formula">W&#8322;&middot;act(W&#8321;x)</span>) or <strong>gated</strong> (<span class="formula">W&#8323;&middot;[act(W&#8321;x) &odot; (W&#8322;x)]</span> — two linear projections multiplied, one passed through an activation; the basis of SwiGLU/GeGLU in modern LLMs). Activations tested: ReLU&sup2;, GELU, SiLU, <span class="formula">x|x|</span> (signed square), bilinear (no activation — the gate is just a second linear branch), and variants with a learnable slope/curvature. (A piecewise-quadratic GELU-approximator, "TriLU," was our original hypothesis; it was the <em>worst</em> variant tried and is not discussed further.)</p>
 
 <h2>4. Results under AdamW</h2>
-<p>Mean validation cross-entropy at 3000 steps, <strong>51M scale</strong> (8 layers, width 512), 5 seeds, AdamW lr=3&times;10&#8315;&#8308;, batch 32, seq 1024. All gated variants use a linear gate unless noted. iqu and sniqu results pending (runs queued).</p>
+<p><strong>Note:</strong> This table is being redone at <strong>124M / 4000 steps</strong> to match the Muon table methodology and eliminate the scale confound. Updated results for relu2, sniqu, xglu, and reglu are in progress and will replace this table shortly.</p>
+<p>Mean validation cross-entropy at 3000 steps, <strong>51M scale</strong> (8 layers, width 512), 5 seeds, AdamW lr=3&times;10&#8315;&#8308;, batch 32, seq 1024. All gated variants use a linear gate unless noted.</p>
 <table>
 <tr><th>Activation</th><th>MLP</th><th>Val loss</th></tr>
 <tr><td><strong>xglu</strong> &mdash; gated, <span class="formula">x + x|x|</span></td><td>gated</td><td class="n"><strong>6.808</strong></td></tr>
@@ -84,8 +85,6 @@
 <tr><td>geglu / swiglu &mdash; gated, GELU / SiLU</td><td>gated</td><td class="n">6.890 / 6.899</td></tr>
 <tr><td>relu2 &mdash; ReLU&sup2; (the record's choice)</td><td>standard</td><td class="n">6.934</td></tr>
 <tr><td>gelu</td><td>standard</td><td class="n">6.996</td></tr>
-<tr><td>iqu &mdash; <span class="formula">x+x&sup2;</span> / <span class="formula">x/(1&minus;x)</span></td><td>standard</td><td class="n"><em>pending</em></td></tr>
-<tr><td>sniqu &mdash; self-normalized iqu</td><td>standard</td><td class="n"><em>pending</em></td></tr>
 </table>
 <div class="good">
 <strong>Under AdamW, three clean findings:</strong>
