@@ -52,14 +52,14 @@
 <strong>Key findings</strong> &mdash; two statistically significant results from 124M-parameter runs under Muon + Polar Express:
 <ol style="margin:0.5em 0 0.3em">
 <li><strong>Gated MLPs reverse from best to worst when switching AdamW &rarr; Muon.</strong> Under AdamW, gating beats standard MLPs by ~0.09 nats. Under Muon, all four gated variants are significantly <em>worse</em> (p&lt;0.05, n=4, &Delta; = +0.10 to +0.16 nats).</li>
-<li><strong>SNIQU significantly beats ReLU&sup2; under Muon</strong> (p&lt;0.0001, n=9, &Delta;&nbsp;=&nbsp;&minus;0.076 nats, all 9 seeds same direction). SNIQU is a new activation we designed for this study &mdash; details below.</li>
+<li><strong>SNIQU significantly beats ReLU&sup2; under Muon</strong> (p&lt;0.0001, n=9, &Delta;&nbsp;=&nbsp;&minus;0.076 nats, all 9 seeds same direction). SNIQU is a new activation I designed for this study &mdash; details below.</li>
 </ol>
 <strong>A single-seed NorMuon screen suggests both effects may not persist under the production optimizer</strong> &mdash; all three activations landed within 0.012 nats at the same optimal LR. A powered multi-seed NorMuon study is underway; see Section 5.
 </div>
 
 <h2>1. Background</h2>
 <p><a href="https://github.com/KellerJordan/modded-nanogpt">Modded-NanoGPT</a> is a community speedrun: train a ~124M-parameter GPT on FineWeb to val loss &le;3.28 nats as fast as possible on 8&times;H100. The record is ~1.4 minutes, using <strong>Muon</strong>, FP8 matmuls, sliding-window attention, and <strong>ReLU&sup2;</strong> (<span class="formula">max(0,x)&sup2;</span>) in the MLP blocks.</p>
-<p>We asked whether changing the activation could improve on the record &mdash; and found a more interesting answer: <strong>activation and gating rankings change dramatically depending on which optimizer you use.</strong></p>
+<p>I asked whether changing the activation could improve on the record &mdash; and found a more interesting answer: <strong>activation and gating rankings change dramatically depending on which optimizer you use.</strong></p>
 
 <h2>2. Experimental setup</h2>
 <div class="box">
@@ -69,7 +69,7 @@
 <strong>Same as benchmark:</strong> model size, Muon + Polar Express, torch.compile, chunked cross-entropy. Not included: FP8, value embeddings, sliding-window attention. Good for ranking; validating on the real benchmark needs rented H100s.
 </div>
 
-<h2>3. What we compared</h2>
+<h2>3. What I compared</h2>
 <p>The MLP block is either <strong>standard</strong> (<span class="formula">W&#8322;&middot;act(W&#8321;x)</span>) or <strong>gated</strong> (<span class="formula">W&#8323;&middot;[act(W&#8321;x) &odot; (W&#8322;x)]</span> &mdash; two projections multiplied, the basis of SwiGLU/GeGLU in modern LLMs). Activations tested: ReLU&sup2;, GELU, SiLU, <span class="formula">x|x|</span> (signed square), bilinear (no activation), and variants with a learnable slope or curvature.</p>
 
 <h2>4. Results under AdamW</h2>
@@ -116,7 +116,7 @@
 
 <div class="box">
 <strong>NorMuon &mdash; does the ranking survive the production optimizer?</strong>
-<p>The record's real optimizer is <strong>NorMuon</strong> (Muon + per-neuron second-moment EMA). Since rankings are optimizer-dependent, we ran a quick single-seed probe across 5 LRs before committing rented-H100 budget.</p>
+<p>The record's real optimizer is <strong>NorMuon</strong> (Muon + per-neuron second-moment EMA). Since rankings are optimizer-dependent, I ran a quick single-seed probe across 5 LRs before committing rented-H100 budget.</p>
 <table>
 <tr><th>LR</th><th>relu2</th><th>relu2_s1</th><th>sniqu</th></tr>
 <tr><td>0.0025</td><td class="n">6.730</td><td class="n">6.700</td><td class="n">6.717</td></tr>
@@ -131,7 +131,7 @@
 
 <div class="box">
 <strong>Designing sniqu</strong>
-<p>We started with <strong>iqu</strong> &mdash; a new C&sup2; piecewise activation: <span class="formula">x + x&sup2;</span> for <span class="formula">x &ge; 0</span>, and <span class="formula">x/(1&minus;x)</span> for <span class="formula">x &lt; 0</span>. No dead zone, costs one reciprocal (no transcendentals), and value/slope/curvature all match at the origin. We thought the interesting nonlinear shape might help under Muon.</p>
+<p>I started with <strong>iqu</strong> &mdash; a new C&sup2; piecewise activation: <span class="formula">x + x&sup2;</span> for <span class="formula">x &ge; 0</span>, and <span class="formula">x/(1&minus;x)</span> for <span class="formula">x &lt; 0</span>. No dead zone, costs one reciprocal (no transcendentals), and value/slope/curvature all match at the origin. I thought the interesting nonlinear shape might help under Muon.</p>
 <p>It didn't &mdash; iqu is a confirmed null (p=0.88, n=9). But the reason pointed to a fix. For <span class="formula">x &sim; N(0,1)</span>, iqu's output has mean &asymp; 0.71 and variance &asymp; 3.19: every MLP layer multiplies the residual stream scale by &radic;3.19 &asymp; 1.8&times; and adds a DC offset. Under AdamW this doesn't matter much &mdash; AdamW adapts per-parameter. Under Muon it does: Muon orthogonalizes each weight-matrix update, and a non-zero activation mean injects a rank-1 "DC" direction into the gradient that Muon treats as genuine signal, degrading conditioning.</p>
 <p>The fix is the same trick SELU used: solve for the shift &beta; and scale &lambda; that make the output zero-mean, unit-variance under Gaussian input. Compute iqu's moments by Gauss&ndash;Hermite quadrature &mdash; <span class="formula">&mu; = E[h] = 0.706</span>, <span class="formula">&sigma;&sup2; = Var[h] = 3.188</span> &mdash; then define:</p>
 <p style="text-align:center"><span class="formula">sniqu(x) = &lambda;&thinsp;(h(x) &minus; &beta;),&nbsp;&nbsp;&nbsp; &beta; = 0.706,&nbsp;&nbsp; &lambda; = 0.560.</span></p>
@@ -149,9 +149,9 @@
 
 <h2>7. Final conclusions</h2>
 <ul>
-<li><strong>Gating is out.</strong> Every gated MLP we tried is significantly worse than plain ReLU&sup2; under Muon at 124M &mdash; and costs more compute on top of that (p&lt;0.05, n=4, all four variants). Not worth touching.</li>
-<li><strong>sniqu is the one activation that actually helps under Muon</strong> (p&lt;0.0001, &Delta;=&minus;0.076, all 9 seeds pointing the same way). The shape change alone (iqu) does nothing &mdash; it's the self-normalization that matters. Whether the win survives NorMuon is still open: a quick single-seed screen showed all three activations within 0.012 nats of each other, which is suspicious, but we need a proper multi-seed run before concluding anything.</li>
-<li><strong>The infrastructure is there if we want to follow up:</strong> sniqu and relu2_s1 are already wired into the real <code>train_gpt.py</code> behind a one-line env flag, the fused Triton kernel works, and there's a turnkey H100 A/B harness in <code>deploy/</code>. If the NorMuon study shows a signal, it would be easy to test on the actual benchmark.</li>
+<li><strong>Gating is out.</strong> Every gated MLP I tried is significantly worse than plain ReLU&sup2; under Muon at 124M &mdash; and costs more compute on top of that (p&lt;0.05, n=4, all four variants). Not worth touching.</li>
+<li><strong>sniqu is the one activation that actually helps under Muon</strong> (p&lt;0.0001, &Delta;=&minus;0.076, all 9 seeds pointing the same way). The shape change alone (iqu) does nothing &mdash; it's the self-normalization that matters. Whether the win survives NorMuon is still open: a quick single-seed screen showed all three activations within 0.012 nats of each other, which is suspicious, but a proper multi-seed run is needed before concluding anything.</li>
+<li><strong>The infrastructure is there to follow up:</strong> sniqu and relu2_s1 are already wired into the real <code>train_gpt.py</code> behind a one-line env flag, the fused Triton kernel works, and there's a turnkey H100 A/B harness in <code>deploy/</code>. If the NorMuon study shows a signal, it would be easy to test on the actual benchmark.</li>
 <li><strong>The bigger takeaway:</strong> activation rankings are optimizer-dependent in a pretty striking way. Gating beats standard MLPs by ~0.09 nats under AdamW, then loses by 0.10&ndash;0.16 under Muon. The whole activation canon &mdash; GELU, SwiGLU, all of it &mdash; was established with Adam. These results suggest you can't just assume those rankings carry over to Muon or other orthogonalizing optimizers, which is worth knowing given how much the optimizer landscape has shifted recently.</li>
 </ul>
 
