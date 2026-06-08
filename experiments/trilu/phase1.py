@@ -260,11 +260,13 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.qkv = nn.Linear(dim, 3 * dim, bias=False)
         self.out = nn.Linear(dim, dim, bias=False)
-        # QK-norm: normalize Q and K per head to unit RMS before attention.
-        # Motivated by conditioning: a non-unit-scale Q/K degrades Muon's
-        # gradient orthogonalization the same way a non-zero activation mean does.
-        self.q_norm = nn.RMSNorm(self.head_dim) if qk_norm else None
-        self.k_norm = nn.RMSNorm(self.head_dim) if qk_norm else None
+        # QK-norm: zero-center and normalize Q and K per head before attention.
+        # LayerNorm (no bias) removes both the mean and scale of each head vector,
+        # preventing a non-zero mean from injecting a rank-1 DC direction into the
+        # gradient that Muon's orthogonalization would treat as genuine signal.
+        # Matches the "zero-centered QK-Norm" used in Gated Attention (DeepSeek-style).
+        self.q_norm = nn.LayerNorm(self.head_dim, bias=False) if qk_norm else None
+        self.k_norm = nn.LayerNorm(self.head_dim, bias=False) if qk_norm else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.shape
@@ -959,10 +961,10 @@ def main():
                     help="orthogonalizer for Muon. polar_express = the real modded-nanogpt schedule "
                          "(default); newton_schulz = classic fixed quintic (what the earlier runs used).")
     ap.add_argument("--qk-norm", action="store_true",
-                    help="apply RMSNorm to Q and K per head before attention (QK-norm). "
-                         "Motivated by the same conditioning argument as sniqu: normalizing "
-                         "Q/K prevents non-unit scale from degrading Muon's gradient "
-                         "orthogonalization.")
+                    help="apply zero-centered QK-norm (LayerNorm, no bias) to Q and K per "
+                         "head before attention. Removes both mean and scale from each head "
+                         "vector, preventing a DC direction from contaminating Muon's gradient "
+                         "orthogonalization. Matches Gated Attention / DeepSeek-style QK-Norm.")
     ap.add_argument("--target-loss", type=float, default=None,
                     help="if set, log steps-to-reach this val loss (benchmark-aligned metric).")
     ap.add_argument("--compile", action="store_true",
