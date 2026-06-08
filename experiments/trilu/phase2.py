@@ -387,7 +387,8 @@ def next_multiple_of_n(v, n):
 class GPT(nn.Module):
     def __init__(self, vocab_size, num_layers, num_heads, head_dim, model_dim,
                  max_seq_len, device, act_name="relu2", act_init="gelu_minimax",
-                 act_slope=0.0, act_shift=0.0, act_curv=1.0, qk_layernorm=False):
+                 act_slope=0.0, act_shift=0.0, act_curv=1.0, qk_layernorm=False,
+                 paired_heads=False):
         super().__init__()
         assert num_layers == 11, \
             f"phase2.py requires num_layers=11 (speedrun topology); got {num_layers}"
@@ -457,9 +458,12 @@ class GPT(nn.Module):
             for _ in range(L)
         ])
 
-        # RoPE
+        # Which layers use paired-head attention (empty = disabled for speed)
+        self.paired_head_layers = set(PAIRED_HEAD_LAYERS) if paired_heads else set()
+
+        # RoPE — only allocate paired Yarn if paired heads are enabled
         self.yarn        = Yarn(head_dim, max_seq_len, device, paired=False)
-        self.yarn_paired = Yarn(head_dim, max_seq_len, device, paired=True)
+        self.yarn_paired = Yarn(head_dim, max_seq_len, device, paired=True) if paired_heads else None
 
     def forward(self, input_ids, targets, bigram_ids):
         B, T = input_ids.shape
@@ -509,7 +513,7 @@ class GPT(nn.Module):
         skip_conn = None
 
         for i in range(L):
-            paired     = (i in PAIRED_HEAD_LAYERS)
+            paired     = (i in self.paired_head_layers)
             key_off    = (i in KEY_OFFSET_LAYERS)
             sa_lam     = sa_lambdas_all[i].bfloat16()
 
@@ -768,6 +772,7 @@ def train_one(config, train_data, val_data, seed, device):
         act_shift=config.get("act_shift", 0.0),
         act_curv=config.get("act_curv", 1.0),
         qk_layernorm=config.get("qk_layernorm", False),
+        paired_heads=config.get("paired_heads", False),
     ).to(device)
 
     cmodel = torch.compile(model) if config.get("compile") else model
@@ -877,6 +882,11 @@ def main():
     ap.add_argument("--muon-ortho", type=str,   default="polar_express",
                     choices=["polar_express", "newton_schulz"])
     ap.add_argument("--adam-lr",    type=float, default=None)
+    ap.add_argument("--paired-heads", action="store_true",
+                    help="enable paired-head attention (layers 0,2,5,9 attend over doubled "
+                         "sequence length). Matches train_gpt.py exactly but ~1.5x slower. "
+                         "Off by default for local experiments; the activation ranking is "
+                         "unlikely to change since paired heads affect attention, not the MLP.")
     ap.add_argument("--qk-layernorm", action="store_true",
                     help="replace the always-on RMSNorm QK-norm with LayerNorm(bias=False), "
                          "which also removes the mean (zero-centered). Tests whether the DC "
@@ -901,6 +911,7 @@ def main():
         act_slope=args.act_slope, act_shift=args.act_shift, act_curv=args.act_curv,
         act_init=args.init, compile=args.compile, target_loss=args.target_loss,
         qk_layernorm=args.qk_layernorm,
+        paired_heads=args.paired_heads,
     ))
 
     if args.device:
