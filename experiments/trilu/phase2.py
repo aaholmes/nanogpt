@@ -585,91 +585,81 @@ class Muon(torch.optim.Optimizer):
 
 
 def build_optimizers(model, config):
-    """Parameter grouping that matches train_gpt.py's param_table logic.
+    opt_name = config.get("optimizer", "normuon")
 
-    NorMuon: all 2D weight matrices in attention and MLP (qk_bank / vo_bank / mlp_bank equivalent).
-    AdamW: everything else, with per-group LR/WD matching train_gpt.py's param_table.
-    """
-    normuon_params = []
-    adam_groups = []
-
-    def adam_group(params, lr_mul=1.0, betas=(0.9, 0.95), wd_mul=1.0):
-        if params:
-            adam_groups.append({
-                "params": params,
-                "base_lr": config["adam_lr"] * lr_mul,
-                "lr": config["adam_lr"] * lr_mul,
-                "betas": betas,
-                "weight_decay": config["adam_wd"] * wd_mul,
-            })
-
-    scalars_params, gates_params, embed_params, ve_params, bigram_params, lmhead_params = \
-        [], [], [], [], [], []
-    trilu_params = []
+    # Partition parameters
+    matrix_params, scalar_params, gate_params = [], [], []
+    ve_params, bigram_params, lmhead_params, other_params, trilu_params = [], [], [], [], []
 
     for name, p in model.named_parameters():
-        # NorMuon: 2D weight matrices in attention and MLP modules
-        if p.ndim == 2 and any(k in name for k in ("attn_modules", "mlp_modules")) \
-                and not any(k in name for k in ("theta_",)):
-            normuon_params.append(p)
-        # Learnable scalars (high LR, no WD)
-        elif name in ("scalars", "post_lambdas", "resid_lambdas", "x0_lambdas", "bigram_lambdas"):
-            scalars_params.append(p)
-        # Gate weights (low WD)
-        elif any(k in name for k in ("smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank")):
-            gates_params.append(p)
-        # Value embeddings (high LR and WD, matching train_gpt.py's value_embeds entry)
-        elif name == "value_embeds":
-            ve_params.append(p)
-        # Bigram embedding (high LR, some WD)
-        elif "bigram_embed" in name:
-            bigram_params.append(p)
-        # lm_head / embed
-        elif name in ("lm_head.weight",):
-            lmhead_params.append(p)
-        # TriLU learnable params
+        if name == "embed.weight":
+            pass  # tied to lm_head, skip
         elif "theta_" in name:
             trilu_params.append(p)
-        # embed is tied to lm_head; don't add separately (optimizer handles via lm_head)
-        elif name == "embed.weight":
-            pass
+        elif p.ndim == 2 and any(k in name for k in ("attn_modules", "mlp_modules")):
+            matrix_params.append(p)
+        elif name in ("scalars", "post_lambdas", "resid_lambdas", "x0_lambdas", "bigram_lambdas"):
+            scalar_params.append(p)
+        elif any(k in name for k in ("smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank")):
+            gate_params.append(p)
+        elif name == "value_embeds":
+            ve_params.append(p)
+        elif "bigram_embed" in name:
+            bigram_params.append(p)
+        elif name == "lm_head.weight":
+            lmhead_params.append(p)
         else:
-            embed_params.append(p)
+            other_params.append(p)
 
-    # Matching train_gpt.py param_table (lr_mul, wd_mul, betas):
-    # scalars: lr_mul=5, wd=0, betas=(0.9,0.99)
-    adam_group(scalars_params,  lr_mul=5.0,  betas=(0.9, 0.99), wd_mul=0.0)
-    # gates: various, but grouped simply here
-    adam_group(gates_params,    lr_mul=0.05, betas=(0.9, 0.99), wd_mul=0.0)
-    # value_embeds: lr_mul=75, wd_mul=5 (train_gpt.py uses aggressive decay on these)
-    adam_group(ve_params,       lr_mul=75.0, betas=(0.75, 0.95), wd_mul=5.0)
-    # bigram_embed: lr_mul=75, wd_mul=5
-    adam_group(bigram_params,   lr_mul=75.0, betas=(0.75, 0.95), wd_mul=5.0)
-    # lm_head: wd_mul=150 (aggressive decay on output embeddings)
-    adam_group(lmhead_params,   lr_mul=1.0,  betas=(0.5, 0.95),  wd_mul=150.0)
-    # other (embed, etc.)
-    adam_group(embed_params,    lr_mul=1.0,  betas=(0.9, 0.95))
-    # TriLU activation params (small LR)
-    adam_group(trilu_params,    lr_mul=0.1,  betas=(0.9, 0.95))
+    if opt_name in ("normuon", "muon"):
+        # ── NorMuon / Muon path ──────────────────────────────────────────────
+        # Matrix weights → Muon/NorMuon. Everything else → AdamW with
+        # per-group lr_muls calibrated to train_gpt.py's param_table
+        # (where adam_lr ≈ 0.008 is the sub-LR for non-matrix params).
+        alr = config["adam_lr"]
+        awd = config["adam_wd"]
 
-    opts = []
-    opt_name = config.get("optimizer", "normuon")
-    if opt_name in ("normuon", "muon") and normuon_params:
+        def ag(params, lr_mul=1.0, betas=(0.9, 0.95), wd_mul=1.0):
+            if params:
+                return {"params": params, "base_lr": alr * lr_mul, "lr": alr * lr_mul,
+                        "betas": betas, "weight_decay": awd * wd_mul}
+
+        adam_groups = list(filter(None, [
+            ag(scalar_params,  lr_mul=5.0,  betas=(0.9, 0.99), wd_mul=0.0),
+            ag(gate_params,    lr_mul=0.05, betas=(0.9, 0.99), wd_mul=0.0),
+            ag(ve_params,      lr_mul=75.0, betas=(0.75, 0.95), wd_mul=5.0),
+            ag(bigram_params,  lr_mul=75.0, betas=(0.75, 0.95), wd_mul=5.0),
+            ag(lmhead_params,  lr_mul=1.0,  betas=(0.5, 0.95),  wd_mul=150.0),
+            ag(other_params,   lr_mul=1.0,  betas=(0.9, 0.95)),
+            ag(trilu_params,   lr_mul=0.1,  betas=(0.9, 0.95)),
+        ]))
+
         mlr   = config.get("muon_lr", 0.023)
         beta2 = config.get("muon_beta2", 0.9) if opt_name == "normuon" else None
-        opts.append(Muon(
-            [{"params": normuon_params, "base_lr": mlr, "lr": mlr}],
-            lr=mlr, beta2=beta2,
-            ortho=config.get("muon_ortho", "polar_express"),
-        ))
-    else:
-        # AdamW for all matrices under adamw mode
-        adam_group(normuon_params, lr_mul=1.0)
+        muon_opt = Muon(
+            [{"params": matrix_params, "base_lr": mlr, "lr": mlr}],
+            lr=mlr, beta2=beta2, ortho=config.get("muon_ortho", "polar_express"),
+        )
+        return [muon_opt, torch.optim.AdamW(adam_groups, lr=alr,
+                                             betas=(0.9, 0.95), weight_decay=awd)]
 
-    if adam_groups:
-        opts.append(torch.optim.AdamW(adam_groups, lr=config["adam_lr"],
-                                      betas=(0.9, 0.95), weight_decay=config["adam_wd"]))
-    return opts
+    else:
+        # ── Pure AdamW path ──────────────────────────────────────────────────
+        # All parameters get Adam. The lr_muls from the NorMuon regime
+        # (75× for embeddings, 5× for scalars) are designed to compensate
+        # for Adam's sub-LR role there and are wrong here. Use uniform LR.
+        alr = config["adam_lr"]
+        awd = config["adam_wd"]
+        all_params = (matrix_params + scalar_params + gate_params +
+                      ve_params + bigram_params + lmhead_params + other_params)
+        groups = []
+        if all_params:
+            groups.append({"params": all_params, "base_lr": alr, "lr": alr,
+                           "betas": (0.9, 0.95), "weight_decay": awd})
+        if trilu_params:
+            groups.append({"params": trilu_params, "base_lr": alr * 0.1, "lr": alr * 0.1,
+                           "betas": (0.9, 0.95), "weight_decay": awd})
+        return [torch.optim.AdamW(groups, lr=alr, betas=(0.9, 0.95), weight_decay=awd)]
 
 
 # -----------------------------------------------------------------------------
