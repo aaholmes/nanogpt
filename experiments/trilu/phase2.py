@@ -611,7 +611,9 @@ def build_optimizers(model, config):
     opt_name = config.get("optimizer", "normuon")
 
     # Partition parameters
-    matrix_params, scalar_params, gate_params = [], [], []
+    # mlp_gate_params: fc_gate weights in GatedMLP (the selection branch)
+    # matrix_params:   all other 2D attention/MLP weights (value/projection branches)
+    matrix_params, mlp_gate_params, scalar_params, gate_params = [], [], [], []
     ve_params, bigram_params, lmhead_params, other_params, trilu_params = [], [], [], [], []
 
     for name, p in model.named_parameters():
@@ -619,8 +621,10 @@ def build_optimizers(model, config):
             pass  # tied to lm_head, skip
         elif "theta_" in name:
             trilu_params.append(p)
+        elif p.ndim == 2 and "mlp_modules" in name and "fc_gate" in name:
+            mlp_gate_params.append(p)  # gating/selection branch of GatedMLP
         elif p.ndim == 2 and any(k in name for k in ("attn_modules", "mlp_modules")):
-            matrix_params.append(p)
+            matrix_params.append(p)    # value/projection branches + attention
         elif name in ("scalars", "post_lambdas", "resid_lambdas", "x0_lambdas", "bigram_lambdas"):
             scalar_params.append(p)
         elif any(k in name for k in ("smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank")):
@@ -634,7 +638,7 @@ def build_optimizers(model, config):
         else:
             other_params.append(p)
 
-    if opt_name in ("normuon", "muon"):
+    if opt_name in ("normuon", "muon", "hybrid", "hybrid-muon"):
         # ── NorMuon / Muon path ──────────────────────────────────────────────
         # Matrix weights → Muon/NorMuon. Everything else → AdamW with
         # per-group lr_muls calibrated to train_gpt.py's param_table
@@ -657,8 +661,21 @@ def build_optimizers(model, config):
             ag(trilu_params,   lr_mul=0.1,  betas=(0.9, 0.95)),
         ]))
 
+        # Hybrid mode: gate branch (fc_gate) → AdamW; value/proj + attention → Muon.
+        # For non-hybrid modes, mlp_gate_params fold into matrix_params (Muon).
+        is_hybrid = opt_name in ("hybrid", "hybrid-muon")
+        if is_hybrid:
+            # Gate matrices join the Adam groups at base adam_lr (no special lr_mul —
+            # in AdamW mode these are the "body" weights, not the sub-LR scalars)
+            if mlp_gate_params:
+                adam_groups.append({"params": mlp_gate_params,
+                                    "base_lr": alr, "lr": alr,
+                                    "betas": (0.9, 0.95), "weight_decay": awd})
+        else:
+            matrix_params = matrix_params + mlp_gate_params  # all matrices → Muon
+
         mlr   = config.get("muon_lr", 0.023)
-        beta2 = config.get("muon_beta2", 0.9) if opt_name == "normuon" else None
+        beta2 = config.get("muon_beta2", 0.9) if opt_name in ("normuon", "hybrid") else None
         muon_opt = Muon(
             [{"params": matrix_params, "base_lr": mlr, "lr": mlr}],
             lr=mlr, beta2=beta2, ortho=config.get("muon_ortho", "polar_express"),
@@ -896,7 +913,11 @@ def main():
     ap.add_argument("--act-shift",  type=float, default=0.0)
     ap.add_argument("--act-curv",   type=float, default=1.0)
     ap.add_argument("--optimizer",  type=str,   default="normuon",
-                    choices=["normuon", "muon", "adamw"])
+                    choices=["normuon", "muon", "adamw", "hybrid", "hybrid-muon"],
+                    help="hybrid/hybrid-muon: gate branch (fc_gate) → AdamW, "
+                         "value/proj + attention → NorMuon/Muon. Tests whether "
+                         "splitting the optimizer by parameter role captures the "
+                         "best of gating (AdamW) and orthogonalization (Muon).")
     ap.add_argument("--muon-lr",    type=float, default=0.023)
     ap.add_argument("--muon-beta2", type=float, default=0.9)
     ap.add_argument("--muon-ortho", type=str,   default="polar_express",
