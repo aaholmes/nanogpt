@@ -289,7 +289,7 @@ _ATTN_GATE_IDX     = {i: (i if i < 6 else i - 1) for i in range(11) if i != 6}
 # Causal Self-Attention (SDPA-based, replaces FA3)
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, model_dim, num_heads, head_dim):
+    def __init__(self, model_dim, num_heads, head_dim, qk_layernorm=False):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim  = head_dim
@@ -301,6 +301,12 @@ class CausalSelfAttention(nn.Module):
         with torch.no_grad():
             self.qkv.weight.uniform_(-bound, bound)
             self.out.weight.uniform_(-bound, bound)
+        # Optional zero-centered QK-norm: LayerNorm(bias=False) removes mean AND scale,
+        # preventing a DC direction from contaminating Muon's gradient orthogonalization.
+        # Default is RMSNorm (scale-only, matches train_gpt.py). LayerNorm is the variant
+        # we want to test: does zero-centering help beyond what RMSNorm already provides?
+        self.q_norm = nn.LayerNorm(head_dim, bias=False) if qk_layernorm else None
+        self.k_norm = nn.LayerNorm(head_dim, bias=False) if qk_layernorm else None
 
     def forward(self, x, yarn, sa_lambdas, paired,
                 attn_gate_w=None, ve=None, ve_gate_w=None, key_offset=False):
@@ -314,8 +320,11 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, H, D)
         v = v.view(B, T, H, D)
 
-        # QK-norm: always-on RMSNorm (matches train_gpt.py `norm(q), norm(k)`)
-        q, k = norm(q), norm(k)
+        # QK-norm: RMSNorm always-on (matches train_gpt.py); LayerNorm if --qk-layernorm
+        if self.q_norm is not None:
+            q, k = self.q_norm(q), self.k_norm(k)
+        else:
+            q, k = norm(q), norm(k)
 
         if not paired:
             q, k = yarn.rotary(q), yarn.rotary(k)
@@ -378,7 +387,7 @@ def next_multiple_of_n(v, n):
 class GPT(nn.Module):
     def __init__(self, vocab_size, num_layers, num_heads, head_dim, model_dim,
                  max_seq_len, device, act_name="relu2", act_init="gelu_minimax",
-                 act_slope=0.0, act_shift=0.0, act_curv=1.0):
+                 act_slope=0.0, act_shift=0.0, act_curv=1.0, qk_layernorm=False):
         super().__init__()
         assert num_layers == 11, \
             f"phase2.py requires num_layers=11 (speedrun topology); got {num_layers}"
@@ -437,7 +446,7 @@ class GPT(nn.Module):
         # Per-layer attention modules with their own weight matrices
         attn_layers = [i for i in range(L) if i != ATTN_SKIP_LAYER]
         self.attn_modules = nn.ModuleList([
-            CausalSelfAttention(model_dim, num_heads, head_dim)
+            CausalSelfAttention(model_dim, num_heads, head_dim, qk_layernorm=qk_layernorm)
             for _ in attn_layers
         ])
         self._attn_layer_idx = {layer: j for j, layer in enumerate(attn_layers)}
@@ -768,6 +777,7 @@ def train_one(config, train_data, val_data, seed, device):
         act_slope=config.get("act_slope", 0.0),
         act_shift=config.get("act_shift", 0.0),
         act_curv=config.get("act_curv", 1.0),
+        qk_layernorm=config.get("qk_layernorm", False),
     ).to(device)
 
     cmodel = torch.compile(model) if config.get("compile") else model
@@ -877,6 +887,10 @@ def main():
     ap.add_argument("--muon-ortho", type=str,   default="polar_express",
                     choices=["polar_express", "newton_schulz"])
     ap.add_argument("--adam-lr",    type=float, default=None)
+    ap.add_argument("--qk-layernorm", action="store_true",
+                    help="replace the always-on RMSNorm QK-norm with LayerNorm(bias=False), "
+                         "which also removes the mean (zero-centered). Tests whether the DC "
+                         "direction matters beyond scale normalization for Muon conditioning.")
     ap.add_argument("--data-dir",   type=str,   default="data/fineweb10B")
     ap.add_argument("--out",        type=str,   default="experiments/trilu/results_phase2.json")
     ap.add_argument("--device",     type=str,   default=None)
@@ -896,6 +910,7 @@ def main():
         muon_lr=args.muon_lr, muon_beta2=args.muon_beta2, muon_ortho=args.muon_ortho,
         act_slope=args.act_slope, act_shift=args.act_shift, act_curv=args.act_curv,
         act_init=args.init, compile=args.compile, target_loss=args.target_loss,
+        qk_layernorm=args.qk_layernorm,
     ))
 
     if args.device:
@@ -935,6 +950,8 @@ def main():
             key += f"_c{args.act_curv:g}"
         if args.optimizer != "normuon":
             key += f"_{args.optimizer}"
+        if args.qk_layernorm:
+            key += "_qkln"
         if key not in all_results:
             all_results[key] = []
         for seed in range(args.seed_start, args.seed_start + args.seeds):
