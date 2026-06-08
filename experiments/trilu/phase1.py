@@ -253,13 +253,18 @@ GATED_ACTIVATIONS = {"swiglu", "geglu", "triglu", "xglu", "reglu", "bilinear"}
 # Model
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int):
+    def __init__(self, dim: int, num_heads: int, qk_norm: bool = False):
         super().__init__()
         assert dim % num_heads == 0
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.qkv = nn.Linear(dim, 3 * dim, bias=False)
         self.out = nn.Linear(dim, dim, bias=False)
+        # QK-norm: normalize Q and K per head to unit RMS before attention.
+        # Motivated by conditioning: a non-unit-scale Q/K degrades Muon's
+        # gradient orthogonalization the same way a non-zero activation mean does.
+        self.q_norm = nn.RMSNorm(self.head_dim) if qk_norm else None
+        self.k_norm = nn.RMSNorm(self.head_dim) if qk_norm else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.shape
@@ -268,6 +273,9 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        if self.q_norm is not None:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
         out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         out = out.transpose(1, 2).contiguous().view(B, T, C)
         return self.out(out)
@@ -413,10 +421,10 @@ def make_mlp(dim: int, model_dim: int, act_name: str, act_init: str,
 class Block(nn.Module):
     def __init__(self, dim, num_heads, model_dim, act_name, act_init,
                  gate_pool=1, gate_pool_type="mean", act_slope=0.0, act_shift=0.0, act_curv=1.0,
-                 gate_act="linear", gate_zero_init=False, dual_act=False):
+                 gate_act="linear", gate_zero_init=False, dual_act=False, qk_norm=False):
         super().__init__()
         self.ln1 = nn.LayerNorm(dim)
-        self.attn = CausalSelfAttention(dim, num_heads)
+        self.attn = CausalSelfAttention(dim, num_heads, qk_norm=qk_norm)
         self.ln2 = nn.LayerNorm(dim)
         self.mlp = make_mlp(dim, model_dim, act_name, act_init,
                             gate_pool=gate_pool, gate_pool_type=gate_pool_type,
@@ -448,7 +456,7 @@ def chunked_cross_entropy(x, weight, targets, chunk):
 class TinyGPT(nn.Module):
     def __init__(self, vocab_size, num_layers, dim, num_heads, seq_len, act_name, act_init,
                  gate_pool=1, gate_pool_type="mean", act_slope=0.0, act_shift=0.0, act_curv=1.0,
-                 gate_act="linear", gate_zero_init=False, dual_act=False):
+                 gate_act="linear", gate_zero_init=False, dual_act=False, qk_norm=False):
         super().__init__()
         self.token_embed = nn.Embedding(vocab_size, dim)
         self.pos_embed = nn.Embedding(seq_len, dim)
@@ -457,7 +465,8 @@ class TinyGPT(nn.Module):
             Block(dim, num_heads, dim, act_name, act_init,
                   gate_pool=gate_pool, gate_pool_type=gate_pool_type,
                   act_slope=act_slope, act_shift=act_shift, act_curv=act_curv,
-                  gate_act=gate_act, gate_zero_init=gate_zero_init, dual_act=dual_act)
+                  gate_act=gate_act, gate_zero_init=gate_zero_init, dual_act=dual_act,
+                  qk_norm=qk_norm)
             for _ in range(num_layers)
         ])
         self.ln_f = nn.LayerNorm(dim)
@@ -763,6 +772,7 @@ def train_one(config, train_data, val_data, seed, device):
         gate_zero_init=config.get("gate_zero_init", False),
         dual_act=config.get("dual_act", False),
         act_shift=config.get("act_shift", 0.0),
+        qk_norm=config.get("qk_norm", False),
     ).to(device)
     model.ce_chunk = config.get("ce_chunk", 0)
     # Compiled view for the train/eval forward (big speedup via kernel fusion); the
@@ -948,6 +958,11 @@ def main():
                     choices=["polar_express", "newton_schulz"],
                     help="orthogonalizer for Muon. polar_express = the real modded-nanogpt schedule "
                          "(default); newton_schulz = classic fixed quintic (what the earlier runs used).")
+    ap.add_argument("--qk-norm", action="store_true",
+                    help="apply RMSNorm to Q and K per head before attention (QK-norm). "
+                         "Motivated by the same conditioning argument as sniqu: normalizing "
+                         "Q/K prevents non-unit scale from degrading Muon's gradient "
+                         "orthogonalization.")
     ap.add_argument("--target-loss", type=float, default=None,
                     help="if set, log steps-to-reach this val loss (benchmark-aligned metric).")
     ap.add_argument("--compile", action="store_true",
@@ -974,6 +989,7 @@ def main():
     cfg_base["gate_act"] = args.gate_act
     cfg_base["gate_zero_init"] = args.gate_zero_init
     cfg_base["dual_act"] = args.dual_act
+    cfg_base["qk_norm"] = args.qk_norm
     cfg_base["compile"] = args.compile
     cfg_base["ce_chunk"] = args.ce_chunk
     cfg_base["optimizer"] = args.optimizer
