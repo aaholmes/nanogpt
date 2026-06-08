@@ -461,6 +461,8 @@ class GPT(nn.Module):
         # Which layers use paired-head attention (empty = disabled for speed)
         self.paired_head_layers = set(PAIRED_HEAD_LAYERS) if paired_heads else set()
 
+        self.ce_chunk = 0  # set externally after construction; 0 = full logits
+
         # RoPE — only allocate paired Yarn if paired heads are enabled
         self.yarn        = Yarn(head_dim, max_seq_len, device, paired=False)
         self.yarn_paired = Yarn(head_dim, max_seq_len, device, paired=True) if paired_heads else None
@@ -547,11 +549,28 @@ class GPT(nn.Module):
         x = x - backout_lambda * x_backout
         x = norm(x)
 
-        # Softcapped cross-entropy (23 * sigmoid((logits+5)/7.5), matching eval path of train_gpt.py)
-        logits = self.lm_head(x)
-        logits = 23 * torch.sigmoid((logits + 5) / 7.5)
-        loss   = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+        # Softcapped cross-entropy (23 * sigmoid((logits+5)/7.5), matching eval path of train_gpt.py).
+        # Chunked to avoid materialising the full (B*T, vocab) logit tensor (~1.65 GB at batch 16).
+        x_flat = x.reshape(-1, x.size(-1))
+        t_flat = targets.reshape(-1)
+        if self.ce_chunk and self.ce_chunk > 0:
+            loss = self._chunked_softcap_ce(x_flat, t_flat, self.ce_chunk)
+        else:
+            logits = 23 * torch.sigmoid((self.lm_head(x_flat) + 5) / 7.5)
+            loss   = F.cross_entropy(logits, t_flat)
         return loss
+
+    def _chunked_softcap_ce(self, x_flat, targets_flat, chunk):
+        def _chunk_loss(x_c, t_c):
+            logits = 23 * torch.sigmoid((self.lm_head(x_c) + 5) / 7.5)
+            return F.cross_entropy(logits, t_c, reduction="sum")
+        n = x_flat.size(0)
+        total = x_flat.new_zeros(())
+        for i in range(0, n, chunk):
+            total = total + torch.utils.checkpoint.checkpoint(
+                _chunk_loss, x_flat[i:i+chunk], targets_flat[i:i+chunk],
+                use_reentrant=False)
+        return total / n
 
 
 # -----------------------------------------------------------------------------
@@ -774,6 +793,7 @@ def train_one(config, train_data, val_data, seed, device):
         qk_layernorm=config.get("qk_layernorm", False),
         paired_heads=config.get("paired_heads", False),
     ).to(device)
+    model.ce_chunk = config.get("ce_chunk", 0)
 
     cmodel = torch.compile(model) if config.get("compile") else model
     n_params = sum(p.numel() for p in model.parameters())
@@ -882,6 +902,9 @@ def main():
     ap.add_argument("--muon-ortho", type=str,   default="polar_express",
                     choices=["polar_express", "newton_schulz"])
     ap.add_argument("--adam-lr",    type=float, default=None)
+    ap.add_argument("--ce-chunk", type=int, default=0,
+                    help="chunk size for cross-entropy (tokens). 0 = full logits (~1.65 GB at "
+                         "batch 16). Use 4096 to avoid OOM on 16 GB GPUs with paired heads.")
     ap.add_argument("--paired-heads", action="store_true",
                     help="enable paired-head attention (layers 0,2,5,9 attend over doubled "
                          "sequence length). Matches train_gpt.py exactly but ~1.5x slower. "
@@ -912,6 +935,7 @@ def main():
         act_init=args.init, compile=args.compile, target_loss=args.target_loss,
         qk_layernorm=args.qk_layernorm,
         paired_heads=args.paired_heads,
+        ce_chunk=args.ce_chunk,
     ))
 
     if args.device:
