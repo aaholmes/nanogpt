@@ -880,6 +880,12 @@ def train_one(config, train_data, val_data, seed, device):
             log["wallclock"].append([step, elapsed])
             print(f"  step {step:5d}  lr={optimizers[0].param_groups[0]['lr']:.5f}"
                   f"  train={loss.item():.4f}  val={val_loss:.4f}  t={elapsed:.1f}s")
+            # Opt-in early stop: once the target is crossed, the time-to-target is
+            # already recorded — no need to keep training (used by the BO search).
+            if config.get("stop_at_target") and config.get("target_loss") \
+                    and val_loss <= config["target_loss"]:
+                print(f"  -> reached target {config['target_loss']} at step {step}, stopping early")
+                break
 
     vals = [v for _, v in log["val_loss"]]
     k = min(5, len(vals))
@@ -980,6 +986,8 @@ def main():
                     help="replace the always-on RMSNorm QK-norm with LayerNorm(bias=False), "
                          "which also removes the mean (zero-centered). Tests whether the DC "
                          "direction matters beyond scale normalization for Muon conditioning.")
+    ap.add_argument("--model-dim",  type=int,   default=None,
+                    help="override model/residual width. num_heads*head_dim must equal it.")
     ap.add_argument("--num-heads",  type=int,   default=None,
                     help="override attention head count (head_dim auto-adjusts only if also "
                          "given). num_heads*head_dim must equal model_dim.")
@@ -991,6 +999,10 @@ def main():
     ap.add_argument("--device",     type=str,   default=None)
     ap.add_argument("--compile",    action="store_true")
     ap.add_argument("--target-loss",type=float, default=None)
+    ap.add_argument("--stop-at-target", action="store_true",
+                    help="stop training as soon as val loss crosses --target-loss "
+                         "(time-to-target is already recorded). Used by the BO search "
+                         "to avoid wasting compute after the objective is measured.")
     args = ap.parse_args()
 
     if args.tiny:
@@ -1000,6 +1012,7 @@ def main():
     if args.steps:      cfg["total_steps"] = args.steps
     if args.batch_size: cfg["batch_size"]  = args.batch_size
     if args.adam_lr:    cfg["adam_lr"]     = args.adam_lr
+    if args.model_dim:  cfg["model_dim"]   = args.model_dim
     if args.num_heads:  cfg["num_heads"]   = args.num_heads
     if args.head_dim:   cfg["head_dim"]    = args.head_dim
     assert cfg["num_heads"] * cfg["head_dim"] == cfg["model_dim"], \
@@ -1011,6 +1024,7 @@ def main():
         muon_lr=args.muon_lr, muon_beta2=args.muon_beta2, muon_ortho=args.muon_ortho,
         act_slope=args.act_slope, act_shift=args.act_shift, act_curv=args.act_curv,
         act_init=args.init, compile=args.compile, target_loss=args.target_loss,
+        stop_at_target=args.stop_at_target,
         qk_layernorm=args.qk_layernorm,
         paired_heads=args.paired_heads,
         kv_tied=args.kv_tied,
