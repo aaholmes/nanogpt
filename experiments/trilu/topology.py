@@ -2,94 +2,114 @@
 Generative, layer-count-agnostic topology for phase2's asymmetric skip structure.
 
 The record architecture is NOT a symmetric U-Net. It has:
-  * one FORWARD skip: save activation at layer `skip_src`, inject it at layer
-    `skip_dst` — and `skip_dst` drops its attention (the skip replaces it).
-  * one BACKOUT: save activation at `backout_src`; later attention layers read
-    that frozen state as input, and `backout_sign * backout_lambda * x_backout`
-    is applied to the residual at the end.
-  * auxiliary per-layer flags (paired-heads, value-embeds, key-offset) that are
-    secondary and placed by an even-spread density rule.
+  * FORWARD skip(s): save activation at `src`, inject it at `dst` — and each
+    `dst` DROPS its attention (the skip replaces it). There can be 0, 1, or more.
+  * a BACKOUT with three possible modes:
+      - 'none':            later attention reads the live residual; nothing
+                           subtracted at the end.
+      - 'freeze_only':     after `backout_src`, later attention layers read the
+                           FROZEN backout state, but it is NOT subtracted at end.
+      - 'freeze_subtract': frozen state used by later attention AND
+                           `backout_lambda * x_backout` subtracted at the end
+                           (the legacy behaviour).
+    Note `backout_lambda` is a FREE learnable scalar, so its effective SIGN is
+    learned — there is no separate sign hyperparameter.
+  * auxiliary per-layer flags (paired-heads, value-embeds, key-offset) placed by
+    an even-spread density rule.
 
-`build_topology(L, params)` maps a small fixed-length parameter vector to a valid
-topology dict for ANY depth L, so a BO can search over it. The DEFAULT params
-reproduce the current L=11 CORE structure (skip 3->6, backout 7, attn-skip at 6)
-exactly; auxiliary placements reproduce the legacy *density*, not exact membership
-(the legacy sets {0,2,5,9} etc. were irregular hand-tuned choices).
+`legacy_topology()` returns the EXACT L=11 record structure (membership-exact),
+used as the default and for the parity check. `build_topology(L, params)` is the
+generative version for a Bayesian search; its defaults reproduce the legacy CORE
+(skip 3->6, backout 7) but auxiliary placements match legacy *density*, not
+membership.
 """
 
-# Legacy L=11 reference (for nesting / validation)
-LEGACY_L11 = dict(
-    num_layers=11,
-    skip_src=3, skip_dst=6,          # forward skip 3 -> 6; layer 6 drops attention
-    backout_src=7, backout_enabled=True, backout_sign=-1,
-    paired_layers={0, 2, 5, 9},
-    ve_layers={1, 2, 8, 9, 10},
-    key_offset_layers={3, 10},
-)
+BACKOUT_MODES = ("none", "freeze_only", "freeze_subtract")
 
-# Default generative params — chosen so the CORE matches LEGACY_L11 at L=11.
+
+def legacy_topology():
+    """Exact L=11 record topology — membership-exact, for default use + parity."""
+    return dict(
+        num_layers=11,
+        skips={6: 3},                       # dst -> src ; layer 6 drops attention
+        backout_src=7,
+        backout_mode="freeze_subtract",
+        paired_layers={0, 2, 5, 9},
+        ve_layers=[1, 2, 8, 9, 10],         # ordered: maps to VE banks 0..4
+        key_offset_layers={3, 10},
+        attn_layers=[i for i in range(11) if i != 6],
+    )
+
+
 DEFAULT_PARAMS = dict(
-    skip_src_frac=0.30,      # 3/10
+    num_skips=1,
+    skip_src_frac=0.30,      # first skip source: 3/10
     skip_span_frac=0.30,     # span 3 -> dst 6
     backout_src_frac=0.70,   # 7/10
-    backout_enabled=True,
-    backout_sign=-1,
+    backout_mode="freeze_subtract",
     paired_density=4 / 11,
     ve_density=5 / 11,
     key_offset_density=2 / 11,
 )
 
 
-def _even_spread(n_on, L):
-    """Place n_on 'on' layers as evenly as possible across [0, L-1]."""
+def _even_spread(n_on, L, lo=0, hi=None):
+    """Place n_on layers as evenly as possible across [lo, hi]."""
+    hi = (L - 1) if hi is None else hi
     if n_on <= 0:
-        return set()
-    if n_on >= L:
-        return set(range(L))
-    # evenly spaced indices, biased to include both ends lightly
-    return {round(i * (L - 1) / (n_on - 1)) if n_on > 1 else (L - 1) // 2
-            for i in range(n_on)}
+        return []
+    if n_on == 1:
+        return [round((lo + hi) / 2)]
+    if n_on >= (hi - lo + 1):
+        return list(range(lo, hi + 1))
+    return [round(lo + i * (hi - lo) / (n_on - 1)) for i in range(n_on)]
 
 
 def build_topology(L, params=None):
-    """Return a topology dict for depth L from generative params.
-
-    Keys: num_layers, skip_src, skip_dst (=attn_skip_layer), backout_src,
-    backout_enabled, backout_sign, paired_layers, ve_layers, key_offset_layers,
-    attn_layers (all layers except skip_dst).
-    """
+    """Return a topology dict for depth L from generative params (for BO search)."""
     p = dict(DEFAULT_PARAMS)
     if params:
         p.update(params)
     last = L - 1
+    span = max(1, round(p["skip_span_frac"] * last))
 
-    # ---- Core skip/backout (the searched structure) ----
-    skip_src = max(0, min(last - 1, round(p["skip_src_frac"] * last)))
-    span     = max(1, round(p["skip_span_frac"] * last))
-    skip_dst = min(last, skip_src + span)
-    if skip_dst <= skip_src:                      # guarantee validity
-        skip_dst = min(last, skip_src + 1)
-    # attn-skip layer can't be 0 or last (need attention at the boundaries)
-    skip_dst = max(1, min(last - 1, skip_dst))
+    # ---- Forward skips (0..k): each dst drops attention ----
+    k = int(p["num_skips"])
+    skips = {}
+    if k > 0:
+        base_src = max(0, min(last - 1, round(p["skip_src_frac"] * last)))
+        if k == 1:
+            srcs = [base_src]                    # single skip anchored at skip_src_frac
+        else:
+            src_hi = max(base_src, last - span)  # spread sources from base toward end
+            srcs = _even_spread(k, L, lo=base_src, hi=src_hi)
+        for s in srcs:
+            dst = min(last - 1, s + span)        # dst interior, drops attention
+            if dst <= s:
+                dst = min(last - 1, s + 1)
+            if 1 <= dst <= last - 1 and dst not in skips and dst != s:
+                skips[dst] = s
 
+    # ---- Backout (placed after the last skip dst, like legacy) ----
     backout_src = max(0, min(last, round(p["backout_src_frac"] * last)))
-    # backout should sit after the skip destination, like the legacy design
-    backout_src = max(skip_dst + 1, backout_src) if skip_dst + 1 <= last else skip_dst
+    if skips:
+        backout_src = max(max(skips) + 1, backout_src) if max(skips) + 1 <= last else backout_src
+    backout_mode = p["backout_mode"]
+    assert backout_mode in BACKOUT_MODES, f"bad backout_mode {backout_mode}"
 
-    # ---- Auxiliary placements (density-driven, scale with L) ----
-    paired = _even_spread(round(p["paired_density"] * L), L) - {skip_dst}
+    attn_skip = set(skips.keys())
+    attn_layers = [i for i in range(L) if i not in attn_skip]
+
+    # ---- Auxiliary placements (density-driven) ----
+    paired = set(_even_spread(round(p["paired_density"] * L), L)) - attn_skip
     ve     = _even_spread(round(p["ve_density"] * L), L)
-    keyoff = _even_spread(round(p["key_offset_density"] * L), L)
-
-    attn_layers = [i for i in range(L) if i != skip_dst]
+    keyoff = set(_even_spread(round(p["key_offset_density"] * L), L))
 
     return dict(
         num_layers=L,
-        skip_src=skip_src,
-        skip_dst=skip_dst,            # == attn_skip_layer
+        skips=skips,
         backout_src=backout_src,
-        backout_enabled=bool(p["backout_enabled"]),
-        backout_sign=int(p["backout_sign"]),
+        backout_mode=backout_mode,
         paired_layers=paired,
         ve_layers=ve,
         key_offset_layers=keyoff,
@@ -97,45 +117,47 @@ def build_topology(L, params=None):
     )
 
 
-def validate_topology(topo):
-    """Raise AssertionError if a topology is structurally invalid."""
-    L = topo["num_layers"]
-    assert 0 <= topo["skip_src"] < topo["skip_dst"] <= L - 1, "bad skip src/dst"
-    assert 1 <= topo["skip_dst"] <= L - 2, "attn-skip layer must be interior"
-    assert 0 <= topo["backout_src"] <= L - 1, "bad backout src"
-    assert topo["skip_dst"] not in topo["paired_layers"], "attn-skip layer can't be paired"
-    assert len(topo["attn_layers"]) == L - 1, "exactly one attn-skip layer"
+def validate_topology(t):
+    L = t["num_layers"]
+    for dst, src in t["skips"].items():
+        assert 0 <= src < dst <= L - 1, f"bad skip {src}->{dst}"
+        assert 1 <= dst <= L - 2, "attn-skip (skip dst) must be interior"
+    assert 0 <= t["backout_src"] <= L - 1, "bad backout src"
+    assert t["backout_mode"] in BACKOUT_MODES, "bad backout mode"
+    assert set(t["attn_layers"]).isdisjoint(t["skips"].keys()), "attn layer is also a skip dst"
+    assert len(t["attn_layers"]) == L - len(t["skips"]), "attn layer count mismatch"
+    assert t["paired_layers"].isdisjoint(t["skips"].keys()), "paired layer can't drop attention"
     return True
 
 
 if __name__ == "__main__":
-    # Self-test: default params at L=11 must reproduce the legacy CORE exactly.
-    t = build_topology(11)
-    validate_topology(t)
-    core_ok = (t["skip_src"] == LEGACY_L11["skip_src"]
-               and t["skip_dst"] == LEGACY_L11["skip_dst"]
-               and t["backout_src"] == LEGACY_L11["backout_src"]
-               and t["backout_enabled"] == LEGACY_L11["backout_enabled"]
-               and t["backout_sign"] == LEGACY_L11["backout_sign"])
-    print(f"L=11 core matches legacy: {core_ok}")
-    print(f"  generated: skip {t['skip_src']}->{t['skip_dst']}  "
-          f"backout {t['backout_src']} (sign {t['backout_sign']})")
-    print(f"  legacy:    skip {LEGACY_L11['skip_src']}->{LEGACY_L11['skip_dst']}  "
-          f"backout {LEGACY_L11['backout_src']}")
-    print(f"  aux densities (paired/ve/keyoff): "
-          f"{len(t['paired_layers'])}/{len(t['ve_layers'])}/{len(t['key_offset_layers'])} of {11}")
-    print(f"    paired={sorted(t['paired_layers'])} ve={sorted(t['ve_layers'])} "
-          f"keyoff={sorted(t['key_offset_layers'])}")
-    print(f"    (legacy paired={sorted(LEGACY_L11['paired_layers'])} "
-          f"ve={sorted(LEGACY_L11['ve_layers'])} — density reproduced, not membership)")
-    assert core_ok, "default params must nest the legacy core"
+    lt = legacy_topology()
+    validate_topology(lt)
+    print(f"legacy: skips={lt['skips']} backout_src={lt['backout_src']} "
+          f"mode={lt['backout_mode']}")
 
-    # Scaling demo across depths
+    g = build_topology(11)
+    validate_topology(g)
+    core_ok = (g["skips"] == lt["skips"] and g["backout_src"] == lt["backout_src"]
+               and g["backout_mode"] == lt["backout_mode"])
+    print(f"L=11 generated core matches legacy: {core_ok}")
+    print(f"  generated: skips={g['skips']} backout_src={g['backout_src']}")
+    assert core_ok, "default generative params must nest the legacy core"
+
+    print("\nVarying num_skips at L=11:")
+    for k in [0, 1, 2, 3]:
+        t = build_topology(11, {"num_skips": k})
+        validate_topology(t)
+        print(f"  k={k}: skips={t['skips']}  attn_layers={t['attn_layers']}")
+
+    print("\nVarying backout_mode:")
+    for m in BACKOUT_MODES:
+        t = build_topology(11, {"backout_mode": m})
+        print(f"  {m}: backout_src={t['backout_src']}")
+
     print("\nScaling across L:")
     for L in [8, 11, 14, 16]:
-        t = build_topology(L)
+        t = build_topology(L, {"num_skips": 2})
         validate_topology(t)
-        print(f"  L={L:2d}: skip {t['skip_src']:2d}->{t['skip_dst']:2d}  "
-              f"backout {t['backout_src']:2d}  "
-              f"paired={sorted(t['paired_layers'])}")
+        print(f"  L={L:2d}: skips={t['skips']}  backout_src={t['backout_src']}")
     print("\nAll topologies valid.")

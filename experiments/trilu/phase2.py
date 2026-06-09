@@ -275,14 +275,18 @@ class Yarn(nn.Module):
         self.attn_scale = 0.1  # from train_gpt.py, inspired by @leloykun
 
 
-# Speedrun layer topology constants — all indexed for 11 layers.
-# phase2.py requires num_layers == 11 to match the record architecture.
-KEY_OFFSET_LAYERS  = {3, 10}   # long-window layers get key offset for induction
+# Speedrun layer topology — the legacy L=11 record structure lives in
+# topology.legacy_topology(); topology.build_topology() generates depth/skip
+# variants for architecture search. The GPT model derives all per-layer indexing
+# from a topology dict (default = legacy), so num_layers and the skip/backout
+# pattern are no longer hardcoded.
+from topology import legacy_topology, build_topology, validate_topology  # noqa: E402
+
+# Legacy constants kept for reference / back-compat with older scripts.
+KEY_OFFSET_LAYERS  = {3, 10}
 PAIRED_HEAD_LAYERS = {0, 2, 5, 9}
-ATTN_SKIP_LAYER    = 6         # layer 6 uses skip connection instead of attention
+ATTN_SKIP_LAYER    = 6
 VE_LAYERS          = {1, 2, 8, 9, 10}
-_VE_GATE_IDX       = {1: 0, 2: 1, 8: 2, 9: 3, 10: 4}
-_ATTN_GATE_IDX     = {i: (i if i < 6 else i - 1) for i in range(11) if i != 6}
 
 
 # -----------------------------------------------------------------------------
@@ -415,10 +419,29 @@ class GPT(nn.Module):
     def __init__(self, vocab_size, num_layers, num_heads, head_dim, model_dim,
                  max_seq_len, device, act_name="relu2", act_init="gelu_minimax",
                  act_slope=0.0, act_shift=0.0, act_curv=1.0, qk_layernorm=False,
-                 paired_heads=False, kv_tied=False, v_identity=False, drop_o=False):
+                 paired_heads=False, kv_tied=False, v_identity=False, drop_o=False,
+                 topology=None):
         super().__init__()
-        assert num_layers == 11, \
-            f"phase2.py requires num_layers=11 (speedrun topology); got {num_layers}"
+        # Topology: default = exact legacy L=11 record structure (parity-preserving).
+        # A passed-in topology dict (from topology.build_topology) enables depth/skip
+        # search. All per-layer indexing below is derived from it.
+        topo = topology if topology is not None else legacy_topology()
+        validate_topology(topo)
+        assert topo["num_layers"] == num_layers, \
+            f"topology num_layers {topo['num_layers']} != requested {num_layers}"
+        self.topo          = topo
+        self.skips         = dict(topo["skips"])              # dst -> src
+        self.skip_dsts     = set(topo["skips"].keys())
+        self.skip_srcs     = set(topo["skips"].values())
+        self.backout_src   = topo["backout_src"]
+        self.backout_mode  = topo["backout_mode"]
+        self.key_offset_layers = set(topo["key_offset_layers"])
+        ve_layers          = list(topo["ve_layers"])         # ordered → bank index
+        self.ve_layers_set = set(ve_layers)
+        self._ve_gate_idx  = {layer: j for j, layer in enumerate(ve_layers)}
+        attn_layers_topo   = list(topo["attn_layers"])
+        self._attn_gate_idx = {layer: j for j, layer in enumerate(attn_layers_topo)}
+        self.n_ve          = len(ve_layers)
         self.num_layers = num_layers
         self.vocab_size = next_multiple_of_n(vocab_size, 128)
         self.model_dim  = model_dim
@@ -433,8 +456,9 @@ class GPT(nn.Module):
         self.bigram_embed = nn.Embedding(BIGRAM_VOCAB_SIZE, model_dim)
         nn.init.zeros_(self.bigram_embed.weight)
 
-        # Value embeddings: 5 banks × vocab × model_dim (small init, matches speedrun)
-        self.value_embeds = nn.Parameter(0.01 * torch.randn(5 * self.vocab_size, model_dim))
+        # Value embeddings: n_ve banks × vocab × model_dim (small init, matches speedrun).
+        # n_ve == 5 for the legacy topology, preserving the RNG draw for parity.
+        self.value_embeds = nn.Parameter(0.01 * torch.randn(self.n_ve * self.vocab_size, model_dim))
 
         # lm_head tied to embed (both (vocab_size, model_dim), standard tie)
         self.lm_head = nn.Linear(model_dim, self.vocab_size, bias=False)
@@ -447,10 +471,12 @@ class GPT(nn.Module):
         nn.init.zeros_(self.smear_gate.weight)
         nn.init.zeros_(self.skip_gate.weight)
 
-        # Per-layer attention gate bank: 10 gates (all layers except 6)
-        # and VE gate bank: 5 gates
-        self.attn_gate_bank = nn.Parameter(torch.zeros(num_layers - 1, num_heads, 12))
-        self.ve_gate_bank   = nn.Parameter(torch.zeros(5, num_heads, 12))
+        # Per-layer attention gate bank: one gate per attention layer (== num_layers
+        # minus the number of skip-destination layers that drop attention).
+        # VE gate bank: one gate per value-embedding layer.
+        n_attn = len(attn_layers_topo)
+        self.attn_gate_bank = nn.Parameter(torch.zeros(n_attn, num_heads, 12))
+        self.ve_gate_bank   = nn.Parameter(torch.zeros(self.n_ve, num_heads, 12))
 
         # Learnable per-layer scalars packed into one parameter (matches train_gpt.py):
         #   indices [2i, 2i+1] = sa_lambdas[i] for layer i (QKV scale, O scale)
@@ -472,14 +498,13 @@ class GPT(nn.Module):
 
         # Attention modules (one shared regular + one shared paired, weights are per-layer)
         # Per-layer attention modules with their own weight matrices
-        attn_layers = [i for i in range(L) if i != ATTN_SKIP_LAYER]
         self.attn_modules = nn.ModuleList([
             CausalSelfAttention(model_dim, num_heads, head_dim,
                                 qk_layernorm=qk_layernorm,
                                 kv_tied=kv_tied, v_identity=v_identity, drop_o=drop_o)
-            for _ in attn_layers
+            for _ in attn_layers_topo
         ])
-        self._attn_layer_idx = {layer: j for j, layer in enumerate(attn_layers)}
+        self._attn_layer_idx = {layer: j for j, layer in enumerate(attn_layers_topo)}
 
         # Per-layer MLP modules
         self.mlp_modules = nn.ModuleList([
@@ -488,7 +513,7 @@ class GPT(nn.Module):
         ])
 
         # Which layers use paired-head attention (empty = disabled for speed)
-        self.paired_head_layers = set(PAIRED_HEAD_LAYERS) if paired_heads else set()
+        self.paired_head_layers = set(topo["paired_layers"]) if paired_heads else set()
 
         self.ce_chunk = 0  # set externally after construction; 0 = full logits
 
@@ -537,28 +562,29 @@ class GPT(nn.Module):
             self.skip_gate(x0[:, :, :12])   # (B, T, 1)
         )
 
-        # Value embeddings: (5, vocab, model_dim) → index by input_ids → (5, B, T, model_dim)
-        ve_all = self.value_embeds.view(5, self.vocab_size, self.model_dim)[:, input_ids]  # (5, B, T, D)
+        # Value embeddings: (n_ve, vocab, model_dim) → index by input_ids → (n_ve, B, T, D)
+        ve_all = self.value_embeds.view(self.n_ve, self.vocab_size, self.model_dim)[:, input_ids]
 
         x_backout = None
-        skip_conn = None
+        skip_store = {}   # src layer -> saved activation, for forward skips
 
         for i in range(L):
             paired     = (i in self.paired_head_layers)
-            key_off    = (i in KEY_OFFSET_LAYERS)
+            key_off    = (i in self.key_offset_layers)
             sa_lam     = sa_lambdas_all[i].bfloat16()
 
             # Value embedding for this layer (if any)
-            ve_i    = ve_all[_VE_GATE_IDX[i]] if i in VE_LAYERS else None  # (B,T,model_dim) or None
-            ve_gw   = self.ve_gate_bank[_VE_GATE_IDX[i]] if i in VE_LAYERS else None
-            attn_gw = self.attn_gate_bank[_ATTN_GATE_IDX[i]] if i != ATTN_SKIP_LAYER else None
+            ve_i    = ve_all[self._ve_gate_idx[i]] if i in self.ve_layers_set else None
+            ve_gw   = self.ve_gate_bank[self._ve_gate_idx[i]] if i in self.ve_layers_set else None
+            attn_gw = self.attn_gate_bank[self._attn_gate_idx[i]] if i not in self.skip_dsts else None
             yarn    = self.yarn_paired if paired else self.yarn
 
-            if i == ATTN_SKIP_LAYER:
-                # No attention; inject skip connection from layer 3
-                x = x + skip_gate_out * skip_conn
+            if i in self.skip_dsts:
+                # No attention; inject the saved skip-source activation in its place
+                x = x + skip_gate_out * skip_store[self.skips[i]]
             else:
                 attn_mod  = self.attn_modules[self._attn_layer_idx[i]]
+                # Backout: once frozen, later attention layers read the frozen state
                 attn_in   = x_backout if x_backout is not None else x
                 attn_out  = attn_mod(
                     norm(attn_in), yarn, sa_lam, paired,
@@ -569,13 +595,15 @@ class GPT(nn.Module):
             mlp_out = self.mlp_modules[i](norm(x))
             x = rl_mlp[i] * x + pl_mlp[i] * mlp_out
 
-            if i == 3:
-                skip_conn = x
-            if i == 7:
+            if i in self.skip_srcs:
+                skip_store[i] = x
+            # Freeze the backout state (used by later attention if mode != 'none')
+            if i == self.backout_src and self.backout_mode != "none":
                 x_backout = x
 
-        # Backout: subtract layer-7 contribution
-        x = x - backout_lambda * x_backout
+        # Backout final op: subtract the frozen state (only in 'freeze_subtract' mode)
+        if self.backout_mode == "freeze_subtract":
+            x = x - backout_lambda * x_backout
         x = norm(x)
 
         # Softcapped cross-entropy (23 * sigmoid((logits+5)/7.5), matching eval path of train_gpt.py).
@@ -841,6 +869,7 @@ def train_one(config, train_data, val_data, seed, device):
         kv_tied=config.get("kv_tied", False),
         v_identity=config.get("v_identity", False),
         drop_o=config.get("drop_o", False),
+        topology=config.get("topology"),
     ).to(device)
     model.ce_chunk = config.get("ce_chunk", 0)
 
