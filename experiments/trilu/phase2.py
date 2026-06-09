@@ -980,6 +980,12 @@ def main():
                     help="replace the always-on RMSNorm QK-norm with LayerNorm(bias=False), "
                          "which also removes the mean (zero-centered). Tests whether the DC "
                          "direction matters beyond scale normalization for Muon conditioning.")
+    ap.add_argument("--num-heads",  type=int,   default=None,
+                    help="override attention head count (head_dim auto-adjusts only if also "
+                         "given). num_heads*head_dim must equal model_dim.")
+    ap.add_argument("--head-dim",   type=int,   default=None,
+                    help="override per-head dimension. Use with --num-heads to sweep head "
+                         "count at fixed model_dim (e.g. 4x192, 6x128, 8x96, 12x64).")
     ap.add_argument("--data-dir",   type=str,   default="data/fineweb10B")
     ap.add_argument("--out",        type=str,   default="experiments/trilu/results_phase2.json")
     ap.add_argument("--device",     type=str,   default=None)
@@ -994,6 +1000,12 @@ def main():
     if args.steps:      cfg["total_steps"] = args.steps
     if args.batch_size: cfg["batch_size"]  = args.batch_size
     if args.adam_lr:    cfg["adam_lr"]     = args.adam_lr
+    if args.num_heads:  cfg["num_heads"]   = args.num_heads
+    if args.head_dim:   cfg["head_dim"]    = args.head_dim
+    assert cfg["num_heads"] * cfg["head_dim"] == cfg["model_dim"], \
+        f"num_heads*head_dim ({cfg['num_heads']}*{cfg['head_dim']}) must equal " \
+        f"model_dim ({cfg['model_dim']}); head_dim must be divisible by 4 for RoPE"
+    assert cfg["head_dim"] % 4 == 0, "head_dim must be divisible by 4 (RoPE frequency bands)"
     cfg.update(dict(
         optimizer=args.optimizer,
         muon_lr=args.muon_lr, muon_beta2=args.muon_beta2, muon_ortho=args.muon_ortho,
@@ -1052,6 +1064,8 @@ def main():
             key += "_vI"
         if args.drop_o:
             key += "_noO"
+        if args.num_heads or args.head_dim:
+            key += f"_h{cfg['num_heads']}x{cfg['head_dim']}"
         if key not in all_results:
             all_results[key] = []
         for seed in range(args.seed_start, args.seed_start + args.seeds):
