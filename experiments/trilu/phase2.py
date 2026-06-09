@@ -289,22 +289,29 @@ _ATTN_GATE_IDX     = {i: (i if i < 6 else i - 1) for i in range(11) if i != 6}
 # Causal Self-Attention (SDPA-based, replaces FA3)
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, model_dim, num_heads, head_dim, qk_layernorm=False):
+    def __init__(self, model_dim, num_heads, head_dim, qk_layernorm=False,
+                 kv_tied=False, v_identity=False):
         super().__init__()
-        self.num_heads = num_heads
-        self.head_dim  = head_dim
-        self.hdim      = num_heads * head_dim
+        assert not (kv_tied and v_identity), "kv_tied and v_identity are mutually exclusive"
+        self.num_heads  = num_heads
+        self.head_dim   = head_dim
+        self.hdim       = num_heads * head_dim
+        self.kv_tied    = kv_tied
+        self.v_identity = v_identity
         std   = 0.5 * model_dim ** -0.5
         bound = (3 ** 0.5) * std
-        self.qkv = nn.Linear(model_dim, 3 * self.hdim, bias=False)
+        if kv_tied or v_identity:
+            # Only Q and K projections; V comes from K (kv_tied) or input x (v_identity)
+            self.qk = nn.Linear(model_dim, 2 * self.hdim, bias=False)
+            with torch.no_grad():
+                self.qk.weight.uniform_(-bound, bound)
+        else:
+            self.qkv = nn.Linear(model_dim, 3 * self.hdim, bias=False)
+            with torch.no_grad():
+                self.qkv.weight.uniform_(-bound, bound)
         self.out = nn.Linear(self.hdim, model_dim, bias=False)
         with torch.no_grad():
-            self.qkv.weight.uniform_(-bound, bound)
             self.out.weight.uniform_(-bound, bound)
-        # Optional zero-centered QK-norm: LayerNorm(bias=False) removes mean AND scale,
-        # preventing a DC direction from contaminating Muon's gradient orthogonalization.
-        # Default is RMSNorm (scale-only, matches train_gpt.py). LayerNorm is the variant
-        # we want to test: does zero-centering help beyond what RMSNorm already provides?
         self.q_norm = nn.LayerNorm(head_dim, bias=False) if qk_layernorm else None
         self.k_norm = nn.LayerNorm(head_dim, bias=False) if qk_layernorm else None
 
@@ -313,12 +320,20 @@ class CausalSelfAttention(nn.Module):
         B, T, _ = x.shape
         H, D = self.num_heads, self.head_dim
 
-        # QKV with learnable Q/K/V scale (sa_lambdas[0])
-        qkv = F.linear(x, sa_lambdas[0] * self.qkv.weight)
-        q, k, v = qkv.chunk(3, dim=-1)
-        q = q.view(B, T, H, D)
-        k = k.view(B, T, H, D)
-        v = v.view(B, T, H, D)
+        # QKV (or QK only) with learnable scale (sa_lambdas[0])
+        if self.kv_tied or self.v_identity:
+            qk = F.linear(x, sa_lambdas[0] * self.qk.weight)
+            q, k = qk.chunk(2, dim=-1)
+            q = q.view(B, T, H, D)
+            k = k.view(B, T, H, D)
+            # V comes from K (before QK-norm/RoPE) or from the normalised input
+            v = k.clone() if self.kv_tied else x.view(B, T, H, D)
+        else:
+            qkv = F.linear(x, sa_lambdas[0] * self.qkv.weight)
+            q, k, v = qkv.chunk(3, dim=-1)
+            q = q.view(B, T, H, D)
+            k = k.view(B, T, H, D)
+            v = v.view(B, T, H, D)
 
         # QK-norm: RMSNorm always-on (matches train_gpt.py); LayerNorm if --qk-layernorm
         if self.q_norm is not None:
@@ -388,7 +403,7 @@ class GPT(nn.Module):
     def __init__(self, vocab_size, num_layers, num_heads, head_dim, model_dim,
                  max_seq_len, device, act_name="relu2", act_init="gelu_minimax",
                  act_slope=0.0, act_shift=0.0, act_curv=1.0, qk_layernorm=False,
-                 paired_heads=False):
+                 paired_heads=False, kv_tied=False, v_identity=False):
         super().__init__()
         assert num_layers == 11, \
             f"phase2.py requires num_layers=11 (speedrun topology); got {num_layers}"
@@ -447,7 +462,9 @@ class GPT(nn.Module):
         # Per-layer attention modules with their own weight matrices
         attn_layers = [i for i in range(L) if i != ATTN_SKIP_LAYER]
         self.attn_modules = nn.ModuleList([
-            CausalSelfAttention(model_dim, num_heads, head_dim, qk_layernorm=qk_layernorm)
+            CausalSelfAttention(model_dim, num_heads, head_dim,
+                                qk_layernorm=qk_layernorm,
+                                kv_tied=kv_tied, v_identity=v_identity)
             for _ in attn_layers
         ])
         self._attn_layer_idx = {layer: j for j, layer in enumerate(attn_layers)}
@@ -809,6 +826,8 @@ def train_one(config, train_data, val_data, seed, device):
         act_curv=config.get("act_curv", 1.0),
         qk_layernorm=config.get("qk_layernorm", False),
         paired_heads=config.get("paired_heads", False),
+        kv_tied=config.get("kv_tied", False),
+        v_identity=config.get("v_identity", False),
     ).to(device)
     model.ce_chunk = config.get("ce_chunk", 0)
 
@@ -923,6 +942,14 @@ def main():
     ap.add_argument("--muon-ortho", type=str,   default="polar_express",
                     choices=["polar_express", "newton_schulz"])
     ap.add_argument("--adam-lr",    type=float, default=None)
+    ap.add_argument("--kv-tied", action="store_true",
+                    help="K=V: share the key projection for values too. Attention output is a "
+                         "weighted sum of key vectors. Saves one projection matrix; tests whether "
+                         "coupling K and V through one matrix helps Muon conditioning.")
+    ap.add_argument("--v-identity", action="store_true",
+                    help="V=identity: skip the V projection entirely, use the normalised input "
+                         "x directly as values. Attention becomes pure routing over the residual "
+                         "stream. Saves one projection matrix.")
     ap.add_argument("--ce-chunk", type=int, default=0,
                     help="chunk size for cross-entropy (tokens). 0 = full logits (~1.65 GB at "
                          "batch 16). Use 4096 to avoid OOM on 16 GB GPUs with paired heads.")
@@ -956,6 +983,8 @@ def main():
         act_init=args.init, compile=args.compile, target_loss=args.target_loss,
         qk_layernorm=args.qk_layernorm,
         paired_heads=args.paired_heads,
+        kv_tied=args.kv_tied,
+        v_identity=args.v_identity,
         ce_chunk=args.ce_chunk,
     ))
 
@@ -998,6 +1027,10 @@ def main():
             key += f"_{args.optimizer}"
         if args.qk_layernorm:
             key += "_qkln"
+        if args.kv_tied:
+            key += "_kv"
+        if args.v_identity:
+            key += "_vI"
         if key not in all_results:
             all_results[key] = []
         for seed in range(args.seed_start, args.seed_start + args.seeds):
