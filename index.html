@@ -54,7 +54,7 @@
 <li><strong>Gating reverses: wins under AdamW, loses under Muon/NorMuon.</strong> Gated MLPs (reglu, xglu) beat relu2 under AdamW and lose under Muon and NorMuon &mdash; same activations, same scale, opposite sign.</li>
 <li><strong>SNIQU reverses too: wins under Muon, loses under AdamW.</strong> SNIQU beats relu2 under Muon and loses under AdamW. SNIQU is a new C&sup2; activation I designed for this study &mdash; details below.</li>
 </ol>
-<strong>Under NorMuon (the production optimizer), sniqu and relu2 are essentially tied</strong> once each gets its own best learning rate. An earlier powered study appeared to show sniqu losing by 0.078; that turned out to be a learning-rate artifact &mdash; sniqu prefers a higher LR than relu2 under NorMuon, and at its own best LR it is within 0.001 of relu2. See Section 6.
+<strong>Under NorMuon (the production optimizer), no tested activation clearly beats relu2.</strong> An earlier powered study appeared to show sniqu losing by 0.078; that was a learning-rate artifact &mdash; sniqu prefers a 2&times; higher LR than relu2 under NorMuon, and at its own best LR lands within noise of relu2. At any shared LR, relu2 wins. A hybrid optimizer (gate&rarr;AdamW, rest&rarr;NorMuon) was also tested and made things slightly worse. See Section 6.
 </div>
 
 <h2>1. Background</h2>
@@ -127,11 +127,19 @@
 <p>Gating still loses both optimizers; sniqu still wins Muon (same direction as phase 1, smaller gap at fewer steps). The rankings are consistent.</p>
 
 <div class="box">
-<strong>NorMuon &mdash; the LR-artifact story</strong>
-<p>An earlier powered study (9 seeds, fixed LR=0.02 for all) appeared to show sniqu losing to relu2 under NorMuon by 0.078. That prompted a concern: what if sniqu's optimal LR under NorMuon is different from relu2's, and we were comparing at the wrong point?</p>
-<p>The phase 2 per-activation LR sweep answered it directly. Sniqu does prefer a higher LR than relu2 under NorMuon (0.04 vs 0.02). At those respective best LRs, the gap collapses to 0.001 &mdash; within noise at n=3 seeds. The 0.078 difference was almost entirely explained by the LR mismatch.</p>
-<p>The sweep also shows the ranking is stable across the tested LR grid &mdash; relu2 edges sniqu at every LR point individually (differences of 0.005&ndash;0.014), but with sniqu at its own best LR those differences vanish. Under NorMuon, sniqu and relu2 are effectively equivalent. <code>relu2_s1</code> is marginally ahead of both (by ~0.002), but n=3 is not enough to call that significant.</p>
-<p>For the record optimizer (NorMuon), no activation tested here clearly beats relu2. The most honest summary: relu2 and relu2_s1 are approximately tied for best, sniqu is competitive but not ahead, and gating is clearly out.</p>
+<strong>NorMuon &mdash; the LR-artifact story and final verdict</strong>
+<p>An earlier powered study (9 seeds, fixed LR=0.02 for all) appeared to show sniqu losing to relu2 under NorMuon by 0.078. That prompted a concern: what if sniqu's optimal LR under NorMuon is different from relu2's?</p>
+<p>The phase 2 per-activation sweep confirmed it: sniqu prefers LR=0.04 under NorMuon while relu2 prefers 0.02. At their respective best LRs the gap collapses to 0.001 &mdash; the 0.078 difference was almost entirely LR mismatch. A finer grid ({0.015, 0.020, 0.025, 0.030}) showed relu2 winning at every individual LR point by 0.007&ndash;0.013, confirming sniqu's tie with relu2 only materialises when sniqu gets to use its own 2&times; higher LR.</p>
+<table>
+<tr><th>LR</th><th>relu2</th><th>sniqu</th><th>&Delta; (sniqu&minus;relu2)</th></tr>
+<tr><td>0.015</td><td class="n">10.108</td><td class="n">10.118</td><td class="n">+0.010</td></tr>
+<tr><td>0.020</td><td class="n">10.105</td><td class="n">10.118</td><td class="n">+0.013</td></tr>
+<tr><td>0.025</td><td class="n">10.108</td><td class="n">10.115</td><td class="n">+0.007</td></tr>
+<tr><td>0.030</td><td class="n">10.108</td><td class="n">10.120</td><td class="n">+0.012</td></tr>
+<tr><td><strong>0.040</strong> <span class="muted">(sniqu best)</span></td><td class="n">&mdash;</td><td class="n"><strong>10.115</strong></td><td class="n">&asymp;0.000</td></tr>
+</table>
+<p class="muted">1 seed &times; 2000 steps each. The tie at LR=0.04 requires giving sniqu a 2&times; higher LR than relu2's optimum &mdash; it is not a like-for-like comparison.</p>
+<p><strong>Verdict: no activation tested here beats relu2 under NorMuon.</strong> The top three (relu2, relu2_s1, sniqu) land within 0.002 of each other at n=3 seeds, which is well within noise. Gating is clearly out. relu2 is approximately optimal among the candidates tested.</p>
 </div>
 
 <div class="box">
@@ -158,15 +166,15 @@
 <p><strong>Why gating loses under Muon.</strong> Gating's multiplicative interaction entangles W&#8321; and W&#8322;'s gradients &mdash; the useful update direction for each depends on what the other is currently doing. Muon orthogonalizes each matrix independently, spreading energy into directions that weren't meaningfully updated by either. The joint credit assignment that gating requires is exactly what per-matrix orthogonalization can't handle. On top of that, plain standard MLPs already train much better under Muon than AdamW (loss drops from 6.93 to 6.20 in these runs), closing the expressivity gap that gating was filling.</p>
 <p><strong>Why sniqu wins over relu2 under Muon but not AdamW.</strong> A non-zero activation mean injects a rank-1 "DC" direction into the gradient that Muon treats as genuine signal, degrading conditioning. ReLU&sup2;'s output mean (~0.57 for standard-normal input) creates exactly this contamination; sniqu eliminates it by design. Under AdamW the per-parameter normalization handles mean and scale automatically, so sniqu's moment-matching buys nothing &mdash; and relu2's dead zone becomes an asset, concentrating gradient signal and acting as a natural stabilizer at higher LRs.</p>
 <p>The one-sentence summary: <strong>AdamW rewards expressivity and sparsity; Muon rewards conditioning and scale control.</strong> Every result in this study follows from that.</p>
-<p><strong>An open conjecture (being tested).</strong> Gating's problem under Muon is the entangled gradients between the gate and value branches. A natural fix: use AdamW on the gate weights and Muon on the value/projection weights. The gate is a routing mechanism with skewed gradient statistics &mdash; exactly where AdamW's per-parameter adaptation helps most. This is the same logic behind the record already using AdamW on embeddings and Muon on weight matrices. Results from this hybrid-optimizer experiment are pending.</p>
+<p><strong>A tested conjecture that failed.</strong> Gating's problem under Muon is the entangled gradients between the gate and value branches. A natural fix: use AdamW on the gate weights and Muon on the value/projection weights &mdash; the same logic behind the record using AdamW on embeddings and Muon on matrices. I tested this (gate&rarr;AdamW, value/proj/attention&rarr;NorMuon) on reglu and xglu. Both got slightly worse: reglu +0.004, xglu +0.010 vs pure NorMuon. Splitting the optimizer by parameter role doesn't rescue gating; the problem runs deeper than gradient statistics.</p>
 <p>The whole activation canon &mdash; GELU (2016), SwiGLU (2020) &mdash; was established under Adam. These results show those rankings don't automatically carry over to Muon.</p>
 
 <h2>8. Final conclusions</h2>
 <ul>
-<li><strong>Gating is out under Muon.</strong> Every gated MLP I tried is significantly worse than relu2 under Muon at 124M (p&lt;0.05, n=4, all four variants) and costs more compute. This holds in both the simplified harness (phase 1) and the full speedrun architecture (phase 2). Not worth touching for Muon-based training.</li>
-<li><strong>sniqu wins under Muon, but not NorMuon.</strong> Under plain Muon, sniqu beats relu2 (p&lt;0.0001, &Delta;=&minus;0.076, all 9 seeds; confirmed in phase 2). The self-normalization is the active ingredient &mdash; iqu (same shape, not normalized) is a null. Under NorMuon, sniqu is effectively tied with relu2 once given its own best LR. NorMuon's per-neuron variance normalization makes the optimizer itself self-normalizing, removing sniqu's advantage.</li>
-<li><strong>For the production optimizer (NorMuon), no activation clearly beats relu2</strong> in these experiments. relu2 and relu2_s1 are approximately tied for best, sniqu is competitive, and gating is clearly out. The infrastructure is there to test on H100s: sniqu and relu2_s1 are already wired into <code>train_gpt.py</code> behind a one-line env flag.</li>
-<li><strong>The bigger takeaway:</strong> it's a clean 2&times;2. Gating wins under AdamW, loses under Muon. Sniqu wins under Muon, loses under AdamW. Same activations, same scale, opposite rankings depending solely on the optimizer. The whole activation canon &mdash; GELU, SwiGLU, all of it &mdash; was established with Adam. Those rankings don't automatically carry over to orthogonalizing optimizers.</li>
+<li><strong>Gating is out under Muon, full stop.</strong> Every gated MLP tested is significantly worse than relu2 under Muon at 124M (p&lt;0.05, n=4, all variants; replicated in phase 2). Splitting the optimizer between gate and value branches doesn't help either &mdash; that was tested and failed. Not worth touching for Muon-based training.</li>
+<li><strong>sniqu wins under plain Muon</strong> (p&lt;0.0001, &Delta;=&minus;0.076, all 9 seeds; same direction in phase 2). Self-normalization is the active ingredient &mdash; iqu (same shape, unnormalized) is a null. This is a real result, but it applies to plain Muon, not to the production optimizer.</li>
+<li><strong>Under NorMuon, nothing tested clearly beats relu2.</strong> Once each activation gets its own best LR, the top three (relu2, relu2_s1, sniqu) land within 0.002 of each other &mdash; well within noise at n=3. Sniqu's tie with relu2 requires a 2&times; higher LR; at any given LR, relu2 wins. NorMuon's per-neuron variance normalization appears to neutralise the conditioning advantage that sniqu had over relu2 under plain Muon.</li>
+<li><strong>The bigger takeaway:</strong> the 2&times;2 is clean &mdash; gating wins AdamW, loses Muon; sniqu wins Muon, loses AdamW. Rankings established under Adam don't carry over to orthogonalizing optimizers. But for the speedrun's actual optimizer (NorMuon), relu2 remains approximately optimal among the activations tested here.</li>
 </ul>
 
 <div class="footer">
