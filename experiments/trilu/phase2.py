@@ -290,7 +290,7 @@ _ATTN_GATE_IDX     = {i: (i if i < 6 else i - 1) for i in range(11) if i != 6}
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, model_dim, num_heads, head_dim, qk_layernorm=False,
-                 kv_tied=False, v_identity=False):
+                 kv_tied=False, v_identity=False, drop_o=False):
         super().__init__()
         assert not (kv_tied and v_identity), "kv_tied and v_identity are mutually exclusive"
         self.num_heads  = num_heads
@@ -298,6 +298,7 @@ class CausalSelfAttention(nn.Module):
         self.hdim       = num_heads * head_dim
         self.kv_tied    = kv_tied
         self.v_identity = v_identity
+        self.drop_o     = drop_o
         std   = 0.5 * model_dim ** -0.5
         bound = (3 ** 0.5) * std
         if kv_tied or v_identity:
@@ -309,9 +310,17 @@ class CausalSelfAttention(nn.Module):
             self.qkv = nn.Linear(model_dim, 3 * self.hdim, bias=False)
             with torch.no_grad():
                 self.qkv.weight.uniform_(-bound, bound)
-        self.out = nn.Linear(self.hdim, model_dim, bias=False)
-        with torch.no_grad():
-            self.out.weight.uniform_(-bound, bound)
+        if drop_o:
+            # No output projection: concatenated head outputs go straight to the
+            # residual stream (only a learnable scalar scale via sa_lambdas[1]).
+            # Requires hdim == model_dim so dims line up with the residual stream.
+            assert self.hdim == model_dim, \
+                f"drop_o requires hdim ({self.hdim}) == model_dim ({model_dim})"
+            self.out = None
+        else:
+            self.out = nn.Linear(self.hdim, model_dim, bias=False)
+            with torch.no_grad():
+                self.out.weight.uniform_(-bound, bound)
         self.q_norm = nn.LayerNorm(head_dim, bias=False) if qk_layernorm else None
         self.k_norm = nn.LayerNorm(head_dim, bias=False) if qk_layernorm else None
 
@@ -388,6 +397,9 @@ class CausalSelfAttention(nn.Module):
             y = y * gate.unsqueeze(-1)                                  # (B, T, H, 1) broadcast
 
         y = y.contiguous().view(B, T, self.hdim)
+        if self.drop_o:
+            # No O matrix: concatenated heads go straight out (scalar scale only)
+            return sa_lambdas[1] * y
         # Output projection with learnable O scale (sa_lambdas[1])
         return F.linear(y, sa_lambdas[1] * self.out.weight)
 
@@ -403,7 +415,7 @@ class GPT(nn.Module):
     def __init__(self, vocab_size, num_layers, num_heads, head_dim, model_dim,
                  max_seq_len, device, act_name="relu2", act_init="gelu_minimax",
                  act_slope=0.0, act_shift=0.0, act_curv=1.0, qk_layernorm=False,
-                 paired_heads=False, kv_tied=False, v_identity=False):
+                 paired_heads=False, kv_tied=False, v_identity=False, drop_o=False):
         super().__init__()
         assert num_layers == 11, \
             f"phase2.py requires num_layers=11 (speedrun topology); got {num_layers}"
@@ -464,7 +476,7 @@ class GPT(nn.Module):
         self.attn_modules = nn.ModuleList([
             CausalSelfAttention(model_dim, num_heads, head_dim,
                                 qk_layernorm=qk_layernorm,
-                                kv_tied=kv_tied, v_identity=v_identity)
+                                kv_tied=kv_tied, v_identity=v_identity, drop_o=drop_o)
             for _ in attn_layers
         ])
         self._attn_layer_idx = {layer: j for j, layer in enumerate(attn_layers)}
@@ -828,6 +840,7 @@ def train_one(config, train_data, val_data, seed, device):
         paired_heads=config.get("paired_heads", False),
         kv_tied=config.get("kv_tied", False),
         v_identity=config.get("v_identity", False),
+        drop_o=config.get("drop_o", False),
     ).to(device)
     model.ce_chunk = config.get("ce_chunk", 0)
 
@@ -950,6 +963,11 @@ def main():
                     help="V=identity: skip the V projection entirely, use the normalised input "
                          "x directly as values. Attention becomes pure routing over the residual "
                          "stream. Saves one projection matrix.")
+    ap.add_argument("--drop-o", action="store_true",
+                    help="Drop the output projection O: concatenated head outputs go straight to "
+                         "the residual stream. Tests whether the MLP can absorb cross-head mixing. "
+                         "Each head is confined to write into its own coordinate block. Requires "
+                         "hdim == model_dim.")
     ap.add_argument("--ce-chunk", type=int, default=0,
                     help="chunk size for cross-entropy (tokens). 0 = full logits (~1.65 GB at "
                          "batch 16). Use 4096 to avoid OOM on 16 GB GPUs with paired heads.")
@@ -985,6 +1003,7 @@ def main():
         paired_heads=args.paired_heads,
         kv_tied=args.kv_tied,
         v_identity=args.v_identity,
+        drop_o=args.drop_o,
         ce_chunk=args.ce_chunk,
     ))
 
@@ -1031,6 +1050,8 @@ def main():
             key += "_kv"
         if args.v_identity:
             key += "_vI"
+        if args.drop_o:
+            key += "_noO"
         if key not in all_results:
             all_results[key] = []
         for seed in range(args.seed_start, args.seed_start + args.seeds):
