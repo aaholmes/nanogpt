@@ -887,11 +887,22 @@ def train_one(config, train_data, val_data, seed, device):
     optimizers = build_optimizers(model, config)
     total_steps = config["total_steps"]
     warmup      = config["warmup"]
+    max_seconds = config.get("max_seconds")  # wall-clock budget; cosine decays on time
     log = {"val_loss": [], "wallclock": [], "config": config, "seed": seed}
 
     t0 = time.time()
     for step in range(total_steps):
-        mult = lr_mult(step, total_steps, warmup)
+        elapsed = time.time() - t0
+        if max_seconds:
+            # Warmup by step, then cosine decay over the TIME budget so the LR
+            # schedule completes regardless of how many steps fit in the budget.
+            if step < warmup:
+                mult = (step + 1) / warmup
+            else:
+                progress = min(1.0, elapsed / max_seconds)
+                mult = 0.1 + 0.45 * (1.0 + math.cos(math.pi * progress))
+        else:
+            mult = lr_mult(step, total_steps, warmup)
         for opt in optimizers:
             for g in opt.param_groups:
                 g["lr"] = g["base_lr"] * mult
@@ -920,6 +931,11 @@ def train_one(config, train_data, val_data, seed, device):
             if config.get("stop_at_target") and config.get("target_loss") \
                     and val_loss <= config["target_loss"]:
                 print(f"  -> reached target {config['target_loss']} at step {step}, stopping early")
+                break
+            # Wall-clock budget: stop once the time budget is exhausted (iso-compute
+            # architecture comparison — objective is the loss reached in the budget).
+            if max_seconds and elapsed >= max_seconds:
+                print(f"  -> reached time budget {max_seconds}s at step {step}, stopping")
                 break
 
     vals = [v for _, v in log["val_loss"]]
@@ -1058,6 +1074,11 @@ def main():
     ap.add_argument("--device",     type=str,   default=None)
     ap.add_argument("--compile",    action="store_true")
     ap.add_argument("--target-loss",type=float, default=None)
+    ap.add_argument("--max-seconds", type=float, default=None,
+                    help="wall-clock training budget in seconds. Cosine LR decays over "
+                         "the budget so the schedule completes; training stops when the "
+                         "budget is exhausted. Use a large --steps so time is the binding "
+                         "constraint. For iso-compute architecture comparison.")
     ap.add_argument("--stop-at-target", action="store_true",
                     help="stop training as soon as val loss crosses --target-loss "
                          "(time-to-target is already recorded). Used by the BO search "
@@ -1105,6 +1126,7 @@ def main():
         drop_o=args.drop_o,
         ce_chunk=args.ce_chunk,
         softcap=(0.0 if args.plain_ce else args.softcap_scale),
+        max_seconds=args.max_seconds,
     ))
 
     if args.device:
