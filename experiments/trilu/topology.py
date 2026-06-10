@@ -100,10 +100,24 @@ def build_topology(L, params=None):
     attn_skip = set(skips.keys())
     attn_layers = [i for i in range(L) if i not in attn_skip]
 
-    # ---- Auxiliary placements (density-driven) ----
-    paired = set(_even_spread(round(p["paired_density"] * L), L)) - attn_skip
-    ve     = _even_spread(round(p["ve_density"] * L), L)
-    keyoff = set(_even_spread(round(p["key_offset_density"] * L), L))
+    # ---- Auxiliary placements ----
+    # At the record depth (L=11) use the record's hand-tuned aux sets so that
+    # build_topology(11, default core) == legacy_topology() exactly (lets prior
+    # legacy-topology observations be injected without inconsistency). At other
+    # depths, scale by an even-spread density rule. Aux layers that became
+    # attention-skip destinations are dropped (a skip-dst has no attention).
+    if L == 11:
+        lt = legacy_topology()
+        paired = set(lt["paired_layers"])
+        ve     = list(lt["ve_layers"])
+        keyoff = set(lt["key_offset_layers"])
+    else:
+        paired = set(_even_spread(round(p["paired_density"] * L), L))
+        ve     = _even_spread(round(p["ve_density"] * L), L)
+        keyoff = set(_even_spread(round(p["key_offset_density"] * L), L))
+    paired = paired - attn_skip
+    ve     = [l for l in ve if l not in attn_skip]
+    keyoff = keyoff - attn_skip
 
     return dict(
         num_layers=L,
@@ -138,11 +152,14 @@ if __name__ == "__main__":
 
     g = build_topology(11)
     validate_topology(g)
-    core_ok = (g["skips"] == lt["skips"] and g["backout_src"] == lt["backout_src"]
-               and g["backout_mode"] == lt["backout_mode"])
-    print(f"L=11 generated core matches legacy: {core_ok}")
-    print(f"  generated: skips={g['skips']} backout_src={g['backout_src']}")
-    assert core_ok, "default generative params must nest the legacy core"
+    full_ok = (g["skips"] == lt["skips"] and g["backout_src"] == lt["backout_src"]
+               and g["backout_mode"] == lt["backout_mode"]
+               and g["paired_layers"] == lt["paired_layers"]
+               and list(g["ve_layers"]) == list(lt["ve_layers"])
+               and g["key_offset_layers"] == lt["key_offset_layers"]
+               and list(g["attn_layers"]) == list(lt["attn_layers"]))
+    print(f"L=11 build_topology(default) == legacy_topology() exactly: {full_ok}")
+    assert full_ok, "default generative params must reproduce legacy EXACTLY at L=11"
 
     print("\nVarying num_skips at L=11:")
     for k in [0, 1, 2, 3]:
